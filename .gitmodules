@@ -1,0 +1,3 @@
+[submodule "k-mamba"]
+	path = k-mamba
+	url = git@github.com:goldensam777/k-mamba.git
