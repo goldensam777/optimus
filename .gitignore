@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*/build/
+
+# Compiled binaries & objects
+*.o
+*.a
+*.so
+*.bin
+*.out
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Logs
+*.log
+nohup.out
+
+# Checkpoints (binaires lourds — committer séparément si voulu)
+*.bin
+
+# Data (corpus — souvent trop lourds pour git)
+# Décommenter si on veut les exclure :
+# cpu/data/
+# cuda/data/
