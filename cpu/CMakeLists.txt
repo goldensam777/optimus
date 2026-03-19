@@ -8,7 +8,7 @@ set(CMAKE_ASM_NASM_COMPILE_OBJECT "<CMAKE_ASM_NASM_COMPILER> <INCLUDES> <FLAGS> 
 set(CMAKE_ASM_NASM_FLAGS "-f elf64 -O3")
 
 # Build k-mamba as subdirectory — CPU only
-set(KMAMBA_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
+set(KMAMBA_BUILD_TESTS   ON  CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_BENCH   OFF CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_CUDA    OFF CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_CPU     ON  CACHE BOOL "" FORCE)
@@ -43,3 +43,41 @@ target_link_options(test_scan PRIVATE -no-pie)
 
 # No PIE — required by k-mamba ASM (32-bit reloc incompatible with PIE)
 target_link_options(kmamba_cpu PRIVATE -no-pie)
+
+# ─── Run targets ──────────────────────────────────────────────────────────────
+# Variables configurables (passer avec -D au cmake ou via make ARGS)
+set(DATA_FILE  ""                CACHE STRING "Fichier texte d'entrainement")
+set(CKPT_FILE  "kmamba_cpu.bin"  CACHE STRING "Checkpoint (lecture/ecriture)")
+set(PROMPT     "Les systemes"    CACHE STRING "Prompt pour la generation")
+
+# make -C build train              → entraine sur texte integre
+add_custom_target(train
+    COMMAND $<TARGET_FILE:kmamba_cpu>
+    DEPENDS kmamba_cpu
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "CPU : entrainement sur texte integre"
+)
+
+# make -C build train-file         → entraine sur DATA_FILE
+add_custom_target(train-file
+    COMMAND $<TARGET_FILE:kmamba_cpu> train "${DATA_FILE}" "${CKPT_FILE}"
+    DEPENDS kmamba_cpu
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "CPU : entrainement sur ${DATA_FILE} -> ${CKPT_FILE}"
+)
+
+# make -C build gen                → genere depuis CKPT_FILE
+add_custom_target(gen
+    COMMAND $<TARGET_FILE:kmamba_cpu> gen "${CKPT_FILE}" "${PROMPT}"
+    DEPENDS kmamba_cpu
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "CPU : generation depuis ${CKPT_FILE}"
+)
+
+# make -C build chat               → REPL interactif
+add_custom_target(chat
+    COMMAND $<TARGET_FILE:kmamba_cpu> chat "${CKPT_FILE}"
+    DEPENDS kmamba_cpu
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "CPU : chat REPL depuis ${CKPT_FILE}"
+)

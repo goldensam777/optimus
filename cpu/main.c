@@ -23,21 +23,21 @@
 /* ============================================================
  * CONFIG — plafond CPU (x86-64 AVX2)
  *
+ * Config nano — test rapide (~60× plus vite que le plafond)
  * Mémoire totale estimée:
- *   params     : 4 × (2 × 512 × 1024) × 4B  =  16 MB
- *   embed+head : 2 × 256 × 512         × 4B  =   1 MB
- *   optim(×6)  : 6 × 16 MB                   =  96 MB
- *   acts       : 5 × 256 × 512         × 4B  =   2.6 MB (réutilisé par batch)
+ *   params     : 2 × (2 × 128 × 256) × 4B   =   0.5 MB
+ *   embed+head : 2 × 256 × 128        × 4B   =   0.25 MB
+ *   optim(×6)  : 6 × 0.5 MB                  =   3 MB
  *   ─────────────────────────────────────────────────────
- *   Total                                     ≈ 115 MB
+ *   Total                                     ≈   5 MB
  * ============================================================ */
 #define VOCAB_SIZE    256
-#define DIM           512
-#define STATE_SIZE    1024
-#define N_LAYERS      4
+#define DIM           256
+#define STATE_SIZE    512
+#define N_LAYERS      5
 #define SEQ_LEN       256
-#define BATCH_SIZE    16
-#define N_EPOCHS      50
+#define BATCH_SIZE    32
+#define N_EPOCHS      200
 #define SAVE_EVERY    10    /* sauvegarde checkpoint tous les N epochs */
 #define LR_BLOCKS     1e-3f
 #define LR_EMBED_HEAD 1e-3f
@@ -49,10 +49,10 @@
 #define TEMPERATURE   0.8f   /* génération : 0.0 = greedy, 1.0 = full stochastic */
 #define GEN_LEN       512    /* nombre de bytes à générer */
 #define CHAT_MAX_RESP 256    /* longueur max d'une réponse en mode chat */
-#define CHAT_USER     "Human: "   /* format dans le contexte — doit matcher le corpus */
-#define CHAT_BOT      "Bot: "     /* idem */
-#define REPL_YOU      "you"       /* label affiché à l'utilisateur */
-#define REPL_CP       "CP"        /* label affiché pour le modèle */
+#define CHAT_USER     "[speaker001:] "   /* format dans le contexte — doit matcher le corpus */
+#define CHAT_BOT      "[speaker002:] "   /* idem */
+#define REPL_YOU      "speaker001"       /* label affiché à l'utilisateur */
+#define REPL_CP       "speaker002"       /* label affiché pour le modèle */
 #define SEED          42
 
 /* ============================================================

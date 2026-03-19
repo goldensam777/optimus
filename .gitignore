@@ -24,7 +24,9 @@ nohup.out
 # Checkpoints (binaires lourds — committer séparément si voulu)
 *.bin
 
-# Data (corpus — souvent trop lourds pour git)
-# Décommenter si on veut les exclure :
-# cpu/data/
-# cuda/data/
+# Data (corpus — trop lourds pour git)
+cuda/data/
+cpu/data/
+
+# Notes personnelles
+READING.md

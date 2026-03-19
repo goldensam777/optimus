@@ -148,8 +148,7 @@ int main(void) {
     {
         MBConfig bc = {
             .dim = 8, .state_size = 8, .seq_len = 4,
-            .dt_scale = 1.0f, .dt_min = 0.001f, .dt_max = 0.1f,
-            .dt_rank = 1.0f, .dt_init = 1.0f
+            .dt_scale = 1.0f, .dt_min = 0.001f, .dt_max = 0.1f
         };
         MambaBlock *block = mamba_block_create(&bc);
         mamba_block_init(block);

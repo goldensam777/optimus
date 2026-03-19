@@ -52,7 +52,7 @@ Les outils de diagnostic sont aussi compilés :
 
 La progression s'affiche en temps réel :
 
-```
+```code
  epoch |   loss   |  ms/epoch
 -------+----------+-----------
        step   50/389  loss=5.4821
@@ -111,7 +111,8 @@ Tous les hyperparamètres sont des `#define` en tête de `main.c` :
 | `WEIGHT_DECAY` | 1e-5     | Régularisation L2                                |
 | `CLIP_NORM`    | 1.0      | Gradient clipping (norme maximale)               |
 | `TEMPERATURE`  | 0.8      | Température de sampling (0=greedy, 1=aléatoire)  |
-| `dt_min`       | 0.001    | Borne inférieure de delta (pas de temps SSM)     |
+| `dt_scale`     | 1.0      | Facteur d'échelle du pas de temps SSM            |
+| `dt_min`       | 0.001    | Borne inférieure de delta (softplus clampé)      |
 | `dt_max`       | 1.0      | Borne supérieure de delta                        |
 | `SEED`         | 42       | Graine aléatoire (init Xavier + sampling)        |
 

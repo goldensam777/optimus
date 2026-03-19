@@ -17,8 +17,9 @@ Paramètres :
   W_in, W_out, A_log, B_proj, C_proj, delta_proj × 4 blocs
   + embedding + LM head = ~17 MB (permanent)
 
-Moments Adam (m + v) :
-  2 × ~17 MB = ~34 MB × (facteur Adam = 3) = ~96 MB (permanent)  ← DOMINANT
+Moments Adam (m + v) pour les MambaBlocks :
+  2 × ~17 MB = ~34 MB × (facteur Adam) = ~96 MB (permanent)  ← DOMINANT
+  + moments embedding/head : 2 × ~1 MB = ~2 MB (permanent, AdamW)
 ```
 
 ---
@@ -174,7 +175,7 @@ Pour k-mamba sur CPU, les FLOPs sont déjà le goulot — **non recommandé**.
 
 2. **Cible 2** (Adam 8-bit) — plus impactif mais plus complexe
    - Modifier `MBOptimState` : remplacer m/v par uint8 + scales
-   - Modifier `mb_optim_step` : dequant → update → requant
+   - Modifier les macros MUON/AdamW dans `mamba_block.c` : dequant → update → requant
    - Valider sur 10 epochs : courbe de loss identique à float32
 
 3. **Mesure finale**
