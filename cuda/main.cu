@@ -34,8 +34,8 @@
 #define STATE_SIZE    512
 #define N_LAYERS      5
 #define SEQ_LEN       256
-#define BATCH_SIZE    8
-#define N_EPOCHS      200
+#define BATCH_SIZE    64
+#define N_EPOCHS      1000
 #define SAVE_EVERY    5
 
 #define LR_BLOCKS     1e-4f
