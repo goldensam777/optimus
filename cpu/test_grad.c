@@ -208,11 +208,12 @@ int main(void) {
         size_t n_out = block->W_out.rows * block->W_out.cols;
         size_t n_a   = block->A_log.rows * block->A_log.cols;
         size_t n_dp  = block->delta_proj.rows * block->delta_proj.cols;
+        size_t n_bc = block->W_B.rows * block->W_B.cols;
         memcpy(b_anal->W_in.data,       block->W_in.data,       n_in  * sizeof(float));
         memcpy(b_anal->W_out.data,      block->W_out.data,      n_out * sizeof(float));
         memcpy(b_anal->A_log.data,      block->A_log.data,      n_a   * sizeof(float));
-        memcpy(b_anal->B_mat.data,      block->B_mat.data,      n_a   * sizeof(float));
-        memcpy(b_anal->C_mat.data,      block->C_mat.data,      n_a   * sizeof(float));
+        memcpy(b_anal->W_B.data,        block->W_B.data,        n_bc  * sizeof(float));
+        memcpy(b_anal->W_C.data,        block->W_C.data,        n_bc  * sizeof(float));
         memcpy(b_anal->delta_proj.data, block->delta_proj.data, n_dp  * sizeof(float));
     }
 
@@ -281,11 +282,12 @@ int main(void) {
         size_t n_in  = block->W_in.rows * block->W_in.cols;
         size_t n_a   = block->A_log.rows * block->A_log.cols;
         size_t n_dp  = block->delta_proj.rows * block->delta_proj.cols;
+        size_t n_bc = block->W_B.rows * block->W_B.cols;
         memcpy(bs->W_out.data,      block->W_out.data,      n_out * sizeof(float));
         memcpy(bs->W_in.data,       block->W_in.data,       n_in  * sizeof(float));
         memcpy(bs->A_log.data,      block->A_log.data,      n_a   * sizeof(float));
-        memcpy(bs->B_mat.data,      block->B_mat.data,      n_a   * sizeof(float));
-        memcpy(bs->C_mat.data,      block->C_mat.data,      n_a   * sizeof(float));
+        memcpy(bs->W_B.data,        block->W_B.data,        n_bc  * sizeof(float));
+        memcpy(bs->W_C.data,        block->W_C.data,        n_bc  * sizeof(float));
         memcpy(bs->delta_proj.data, block->delta_proj.data, n_dp  * sizeof(float));
     }
 

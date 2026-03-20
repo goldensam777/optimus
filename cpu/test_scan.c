@@ -191,8 +191,9 @@ int main(void) {
         for (int t = 0; t < 4; t++) {
             float dt = 0.01f;
             for (int d = 0; d < 8; d++) {
-                B_s[t*8+d] = block->B_mat.data[d];
-                C_s[t*8+d] = block->C_mat.data[d];
+                /* W_B/W_C are now projection matrices; use first row as proxy for test */
+                B_s[t*8+d] = block->W_B.data[d * block->W_B.cols];
+                C_s[t*8+d] = block->W_C.data[d * block->W_C.cols];
                 d_s[t*8+d] = dt;
             }
         }

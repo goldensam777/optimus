@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(kmamba_cpu LANGUAGES C ASM_NASM)
 
+find_package(OpenMP REQUIRED)
+
 set(CMAKE_C_STANDARD 11)
 
 # NASM configuration (mirrors k-mamba's setup)
@@ -22,12 +24,12 @@ add_executable(kmamba_cpu main.c)
 add_executable(test_grad test_grad.c)
 add_executable(test_scan test_scan.c)
 
-target_link_libraries(kmamba_cpu PRIVATE k-mamba::k-mamba m)
+target_link_libraries(kmamba_cpu PRIVATE k-mamba::k-mamba m OpenMP::OpenMP_C)
 target_link_libraries(test_grad  PRIVATE k-mamba::k-mamba m)
 target_link_libraries(test_scan  PRIVATE k-mamba::k-mamba m)
 
 target_compile_options(kmamba_cpu PRIVATE
-    -O3 -mavx2
+    -O3 -mavx2 -fopenmp
     -Wall -Wextra
     -Wno-unused-parameter
 )

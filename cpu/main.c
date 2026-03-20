@@ -32,15 +32,15 @@
  *   Total                                     ≈   5 MB
  * ============================================================ */
 #define VOCAB_SIZE    256
-#define DIM           256
-#define STATE_SIZE    512
-#define N_LAYERS      5
-#define SEQ_LEN       256
-#define BATCH_SIZE    32
+#define DIM           128
+#define STATE_SIZE    256
+#define N_LAYERS      3
+#define SEQ_LEN       128
+#define BATCH_SIZE    64
 #define N_EPOCHS      200
 #define SAVE_EVERY    10    /* sauvegarde checkpoint tous les N epochs */
-#define LR_BLOCKS     1e-3f
-#define LR_EMBED_HEAD 1e-3f
+#define LR_BLOCKS     3e-4f
+#define LR_EMBED_HEAD 3e-4f
 #define WEIGHT_DECAY  1e-5f
 #define CLIP_NORM     1.0f
 #define MOMENTUM      0.9f
@@ -395,7 +395,7 @@ int main(int argc, char *argv[]) {
     if (!m) {
         m = kmamba_create(&cfg);
         kmamba_init(m, SEED);
-        kmamba_enable_training(m, &opt, LR_EMBED_HEAD, WEIGHT_DECAY);
+        kmamba_enable_training_with_optimizer(m, OPTIMIZER_ADAMW, &opt, LR_EMBED_HEAD, WEIGHT_DECAY);
         printf("[modèle initialisé (Xavier, seed=%d)]\n\n", SEED);
     }
 
