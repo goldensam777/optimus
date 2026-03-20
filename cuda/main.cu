@@ -65,7 +65,7 @@ void gpu_block_forward(
     float *d_B_exp, float *d_C_exp, float *d_dt_exp,
     float *d_h_store, float *d_y_scan, float *d_y_proj,
     float *d_lambda_raw, float *d_lambda,
-    int L, int state, int dim);
+    int L, int state, int dim, int R);
 
 void gpu_block_backward(
     cublasHandle_t cublas,
@@ -88,7 +88,7 @@ void gpu_block_backward(
     float *d_ddt, float *d_ddt_raw,
     float *d_dB_scan, float *d_dC_scan, float *d_ddt_scan,
     float *d_dA_tmp, float *d_dlambda, float *d_dlambda_raw,
-    int L, int state, int dim);
+    int L, int state, int dim, int R);
 
 #ifdef __cplusplus
 }
@@ -459,7 +459,7 @@ static float gpu_forward_backward(GpuModel *m,
             w->B_exp, w->C_exp, w->dt_exp,
             w->h_store, w->y_scan, w->y_proj,
             w->lambda_raw, w->lambda,
-            L_in, S, D);
+            L_in, S, D, 1);  /* R=1 (SISO) */
     }
 
     /* Head : logits [L_in, V] = hidden [L_in, D] @ head^T [D, V] */
@@ -517,7 +517,7 @@ static float gpu_forward_backward(GpuModel *m,
             w->ddt, w->ddt_raw,
             w->dB_scan, w->dC_scan, w->ddt_scan,
             w->dA_tmp, w->dlambda, w->dlambda_raw,
-            L_in, S, D);
+            L_in, S, D, 1);  /* R=1 (SISO) */
         /* Préparer le gradient pour la couche suivante */
         CUDA_CHECK(cudaMemcpy(m->d_dy, m->d_hidden, L_in * D * sizeof(float),
                               cudaMemcpyDeviceToDevice));
@@ -692,7 +692,7 @@ static int gpu_generate_token(GpuModel *m, const uint8_t *ctx, int ctx_len,
             w->B_exp, w->C_exp, w->dt_exp,
             w->h_store, w->y_scan, w->y_proj,
             w->lambda_raw, w->lambda,
-            L, S, D);
+            L, S, D, 1);  /* R=1 (SISO) */
     }
 
     /* Logit du dernier token : hidden[(L-1)*D ..] @ head^T */
