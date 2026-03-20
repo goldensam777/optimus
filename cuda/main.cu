@@ -59,6 +59,7 @@ void gpu_block_forward(
     const float *d_W_in, const float *d_W_out,
     const float *d_A_log, const float *d_W_B, const float *d_W_C,
     const float *d_delta_proj,
+    const float *d_theta,
     const float *d_x, float *d_y,
     float *d_u_raw, float *d_u,
     float *d_dt_raw, float *d_dt,
@@ -72,6 +73,7 @@ void gpu_block_backward(
     const float *d_A_log,
     const float *d_W_B, const float *d_W_C,
     const float *d_delta_proj,
+    const float *d_theta,
     const float *d_x,
     const float *d_u_raw, const float *d_u,
     const float *d_dt_raw, const float *d_dt,
@@ -80,6 +82,7 @@ void gpu_block_backward(
     const float *d_dy,
     float *d_dW_in, float *d_dW_out, float *d_dA_log,
     float *d_dW_B, float *d_dW_C, float *d_ddelta_proj,
+    float *d_g_theta,
     float *d_dx,
     float *d_dy_scan, float *d_du, float *d_du_raw,
     float *d_ddt, float *d_ddt_raw,
@@ -106,14 +109,17 @@ typedef struct {
     float *W_in,  *W_out;
     float *A_log, *W_B, *W_C;
     float *delta_proj;
+    float *theta;          /* [state/2] rotation angles */
     /* Gradients */
     float *g_W_in,  *g_W_out;
     float *g_A_log, *g_W_B, *g_W_C;
     float *g_delta_proj;
+    float *g_theta;        /* [state/2] */
     /* Momentum (MUON) */
     float *m_W_in,  *m_W_out;
     float *m_A_log, *m_W_B, *m_W_C;
     float *m_delta_proj;
+    float *m_theta;        /* [state/2] */
     /* Variance (AdamW pour embed/head) */
     float *v_W_in,  *v_W_out;
 } GpuBlock;
@@ -301,6 +307,7 @@ static GpuModel *gpu_model_create(void) {
         GpuBlock     *b = &m->blocks[i];
         GpuWorkspace *w = &m->ws[i];
 
+        int TS = S / 2; if (TS < 1) TS = 1; /* theta size = state/2 */
         b->W_in  = gpu_alloc(S * D); b->g_W_in  = gpu_alloc(S * D);
         b->m_W_in= gpu_alloc(S * D); b->v_W_in  = gpu_alloc(S * D);
         b->W_out = gpu_alloc(D * S); b->g_W_out = gpu_alloc(D * S);
@@ -313,12 +320,15 @@ static GpuModel *gpu_model_create(void) {
         b->m_W_C = gpu_alloc(S*D);
         b->delta_proj = gpu_alloc(D); b->g_delta_proj = gpu_alloc(D);
         b->m_delta_proj = gpu_alloc(D);
+        b->theta  = gpu_alloc(TS);   b->g_theta  = gpu_alloc(TS);
+        b->m_theta= gpu_alloc(TS);
 
         /* Zéro des moments */
         gpu_zero(b->m_W_in, S*D); gpu_zero(b->v_W_in, S*D);
         gpu_zero(b->m_W_out, D*S); gpu_zero(b->v_W_out, D*S);
         gpu_zero(b->m_A_log, S); gpu_zero(b->m_W_B, S*D);
         gpu_zero(b->m_W_C, S*D); gpu_zero(b->m_delta_proj, D);
+        gpu_zero(b->m_theta, TS);
 
         /* Workspace forward */
         w->u_raw    = gpu_alloc(L * S); w->u       = gpu_alloc(L * S);
@@ -358,27 +368,43 @@ static void gpu_model_init(GpuModel *m) {
 
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
+        int TS = S / 2; if (TS < 1) TS = 1;
         xavier_init_gpu(b->W_in,       S, D, S * D, &seed);
         xavier_init_gpu(b->W_out,      D, S, D * S, &seed);
         a_log_init_gpu(b->A_log, S, &seed);
         xavier_init_gpu(b->W_B,        S, D, S*D,   &seed);
         xavier_init_gpu(b->W_C,        S, D, S*D,   &seed);
         xavier_init_gpu(b->delta_proj, 1, D, D,     &seed);
+        /* Init theta small ~ 2π/S */
+        {
+            float *h_theta = (float *)malloc(TS * sizeof(float));
+            float base = 6.2831853f / (float)S;
+            for (int ti = 0; ti < TS; ti++) {
+                float r = ((float)(*seed = *seed * 1664525u + 1013904223u) + 1.0f) / 4294967296.0f;
+                h_theta[ti] = r * base;
+            }
+            CUDA_CHECK(cudaMemcpy(b->theta, h_theta, TS * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+            free(h_theta);
+        }
         /* Zéro des gradients */
         gpu_zero(b->g_W_in, S*D); gpu_zero(b->g_W_out, D*S);
         gpu_zero(b->g_A_log, S);  gpu_zero(b->g_W_B, S*D);
         gpu_zero(b->g_W_C, S*D);  gpu_zero(b->g_delta_proj, D);
+        gpu_zero(b->g_theta, TS);
     }
 }
 
 static void gpu_zero_grads(GpuModel *m) {
     int V = m->vocab, D = m->dim, S = m->state;
+    int TS = S / 2; if (TS < 1) TS = 1;
     gpu_zero(m->d_g_embed, V*D); gpu_zero(m->d_g_head, V*D);
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
         gpu_zero(b->g_W_in,  S*D); gpu_zero(b->g_W_out,  D*S);
         gpu_zero(b->g_A_log, S);   gpu_zero(b->g_W_B,   S*D);
         gpu_zero(b->g_W_C,  S*D);  gpu_zero(b->g_delta_proj, D);
+        gpu_zero(b->g_theta, TS);
     }
 }
 
@@ -417,6 +443,7 @@ static float gpu_forward_backward(GpuModel *m,
          * IMPORTANT : x != y pour que le résiduel y = y_proj + x soit correct */
         gpu_block_forward(
             h, b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
+            b->theta,
             w->layer_input, m->d_hidden,   /* x=copie, y=hidden */
             w->u_raw, w->u, w->dt_raw, w->dt,
             w->B_exp, w->C_exp, w->dt_exp,
@@ -464,6 +491,7 @@ static float gpu_forward_backward(GpuModel *m,
         gpu_block_backward(
             h,
             b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
+            b->theta,
             w->layer_input,
             w->u_raw, w->u, w->dt_raw, w->dt,
             w->B_exp, w->C_exp, w->dt_exp,
@@ -471,6 +499,7 @@ static float gpu_forward_backward(GpuModel *m,
             m->d_dy,
             b->g_W_in, b->g_W_out, b->g_A_log,
             b->g_W_B, b->g_W_C, b->g_delta_proj,
+            b->g_theta,
             m->d_hidden,  /* dx de sortie → écrase hidden */
             w->dy_scan, w->du, w->du_raw,
             w->ddt, w->ddt_raw,
@@ -502,6 +531,7 @@ static void gpu_optimizer_step(GpuModel *m, const MBOptimConfig *conf_blk,
                       V * D, conf_eh, m->step);
 
     /* Blocs : MUON device-native (paramètres déjà en VRAM) */
+    int TS = S / 2; if (TS < 1) TS = 1;
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
         muon_update_mat_device(b->W_in,  b->g_W_in,  b->m_W_in,  S, D, conf_blk);
@@ -510,13 +540,14 @@ static void gpu_optimizer_step(GpuModel *m, const MBOptimConfig *conf_blk,
         muon_update_mat_device(b->W_B,  b->g_W_B,  b->m_W_B,  S, D, conf_blk);
         muon_update_mat_device(b->W_C,  b->g_W_C,  b->m_W_C,  S, D, conf_blk);
         muon_update_vec_device(b->delta_proj, b->g_delta_proj, b->m_delta_proj, D, conf_blk);
+        muon_update_vec_device(b->theta,      b->g_theta,      b->m_theta,      TS, conf_blk);
     }
 }
 
 /* ── Checkpoint save/load ─────────────────────────────────────── */
 
 #define CKPT_MAGIC 0x4B4D4755  /* "KMGU" */
-#define CKPT_VER   3           /* v3: W_B/W_C [state x dim] au lieu de B_mat/C_mat [state] */
+#define CKPT_VER   4           /* v4: adds theta (complex SSM angles) */
 
 static void save_param(FILE *f, float *d_p, size_t n) {
     float *h = (float *)malloc(n * sizeof(float));
@@ -544,14 +575,17 @@ static void gpu_model_save(GpuModel *m, const char *path, int epoch) {
     fwrite(cfg, 4, 5, f);
     save_param(f, m->d_embed, V * D);
     save_param(f, m->d_head,  V * D);
+    int TS = S / 2; if (TS < 1) TS = 1;
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
         save_param(f, b->W_in,  S * D); save_param(f, b->W_out,  D * S);
         save_param(f, b->A_log, S);     save_param(f, b->W_B,   S * D);
         save_param(f, b->W_C,  S * D); save_param(f, b->delta_proj, D);
+        save_param(f, b->theta, TS);
         save_param(f, b->m_W_in, S*D);  save_param(f, b->m_W_out, D*S);
         save_param(f, b->m_A_log, S);   save_param(f, b->m_W_B, S*D);
         save_param(f, b->m_W_C, S*D);   save_param(f, b->m_delta_proj, D);
+        save_param(f, b->m_theta, TS);
     }
     save_param(f, m->d_m_embed, V*D); save_param(f, m->d_m_head, V*D);
     fwrite(&m->step, sizeof(size_t), 1, f);
@@ -578,14 +612,17 @@ static int gpu_model_load(GpuModel *m, const char *path, int *epoch_out) {
     if (!load_param(f, m->d_embed, V*D) || !load_param(f, m->d_head, V*D)) {
         fclose(f); return 0;
     }
+    int TS = S / 2; if (TS < 1) TS = 1;
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        if (!load_param(f,b->W_in,S*D)  ||!load_param(f,b->W_out,D*S)||
-            !load_param(f,b->A_log,S)   ||!load_param(f,b->W_B,S*D)  ||
-            !load_param(f,b->W_C,S*D)   ||!load_param(f,b->delta_proj,D)||
-            !load_param(f,b->m_W_in,S*D)||!load_param(f,b->m_W_out,D*S)||
-            !load_param(f,b->m_A_log,S) ||!load_param(f,b->m_W_B,S*D)||
-            !load_param(f,b->m_W_C,S*D) ||!load_param(f,b->m_delta_proj,D)) {
+        if (!load_param(f,b->W_in,S*D)   ||!load_param(f,b->W_out,D*S)||
+            !load_param(f,b->A_log,S)    ||!load_param(f,b->W_B,S*D)  ||
+            !load_param(f,b->W_C,S*D)    ||!load_param(f,b->delta_proj,D)||
+            !load_param(f,b->theta,TS)   ||
+            !load_param(f,b->m_W_in,S*D) ||!load_param(f,b->m_W_out,D*S)||
+            !load_param(f,b->m_A_log,S)  ||!load_param(f,b->m_W_B,S*D)||
+            !load_param(f,b->m_W_C,S*D)  ||!load_param(f,b->m_delta_proj,D)||
+            !load_param(f,b->m_theta,TS)) {
             fclose(f); return 0;
         }
     }
@@ -636,7 +673,8 @@ static int gpu_generate_token(GpuModel *m, const uint8_t *ctx, int ctx_len,
         CUDA_CHECK(cudaMemcpy(w->layer_input, m->d_hidden, L*D*sizeof(float),
                               cudaMemcpyDeviceToDevice));
         gpu_block_forward(
-            h, b->W_in, b->W_out, b->A_log, b->B_mat, b->C_mat, b->delta_proj,
+            h, b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
+            b->theta,
             w->layer_input, m->d_hidden,   /* x=copie, y=hidden */
             w->u_raw, w->u, w->dt_raw, w->dt,
             w->B_exp, w->C_exp, w->dt_exp,
