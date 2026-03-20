@@ -251,19 +251,12 @@ int main(void) {
     }
 
     /* Save weights before step */
-    float W_out_before[DIM * STATE];
-    memcpy(W_out_before, m_probe->layers[0]->W_out.data, DIM * STATE * sizeof(float));
+    size_t n_out_probe = m_probe->layers[0]->W_out.rows * m_probe->layers[0]->W_out.cols;
+    float *W_out_before = (float *)malloc(n_out_probe * sizeof(float));
+    memcpy(W_out_before, m_probe->layers[0]->W_out.data, n_out_probe * sizeof(float));
 
-    float loss_probe = kmamba_train_step(m_probe, tokens);
-
-    /* Gradient analytique approx : (w_before - w_after) / lr */
-    /* With Adam at step 1: param -= lr * g / (|g| + eps).
-     * So g_analytical ≈ (w_before - w_after) / lr * |g| / ... complicated.
-     *
-     * Better: use SGD with mu=0 and no correction:
-     * param -= lr * g  →  g ≈ (w_before - w_after) / lr
-     */
-    /* Let's redo with SGD */
+    kmamba_train_step(m_probe, tokens);
+    free(W_out_before);
     kmamba_free(m_probe);
 
     MBOptimConfig opt_sgd = {
@@ -291,8 +284,9 @@ int main(void) {
         memcpy(bs->delta_proj.data, block->delta_proj.data, n_dp  * sizeof(float));
     }
 
-    float W_out_ref[DIM * STATE];
-    memcpy(W_out_ref, m_sgd->layers[0]->W_out.data, DIM * STATE * sizeof(float));
+    size_t n_out = m_sgd->layers[0]->W_out.rows * m_sgd->layers[0]->W_out.cols;
+    float *W_out_ref = (float *)malloc(n_out * sizeof(float));
+    memcpy(W_out_ref, m_sgd->layers[0]->W_out.data, n_out * sizeof(float));
 
     kmamba_train_step(m_sgd, tokens);
 
@@ -300,11 +294,10 @@ int main(void) {
     /* (SGD: w_after = w_ref - lr * m, with mu=0: m = g, so g = (w_ref - w_after)/lr) */
     float *W_out_after_sgd = m_sgd->layers[0]->W_out.data;
 
-    /* Check first 8 elements of W_out */
-    printf("  Checking W_out[0..%d] (dim=%d, state=%d):\n", DIM*STATE-1, DIM, STATE);
+    printf("  Checking W_out[0..%zu] (dim=%d, R=%zu):\n", n_out-1, DIM, n_out / DIM);
 
     int total_nonzero = 0;
-    for (int i = 0; i < DIM * STATE; i++) {
+    for (int i = 0; i < (int)n_out; i++) {
         float g_anal = (W_out_ref[i] - W_out_after_sgd[i]) / lr_probe;
 
         /* Finite difference */
@@ -312,14 +305,14 @@ int main(void) {
 
         KMamba *mfp = kmamba_load("/tmp/test_grad_ref.bin", 0, NULL, 0.0f, 0.0f);
         MambaBlock *bfp = mfp->layers[0];
-        memcpy(bfp->W_out.data, W_out_ref, DIM * STATE * sizeof(float));
+        memcpy(bfp->W_out.data, W_out_ref, n_out * sizeof(float));
         bfp->W_out.data[i] = w_orig + EPS;
         float loss_plus = compute_loss(mfp, tokens);
         kmamba_free(mfp);
 
         KMamba *mfm = kmamba_load("/tmp/test_grad_ref.bin", 0, NULL, 0.0f, 0.0f);
         MambaBlock *bfm = mfm->layers[0];
-        memcpy(bfm->W_out.data, W_out_ref, DIM * STATE * sizeof(float));
+        memcpy(bfm->W_out.data, W_out_ref, n_out * sizeof(float));
         bfm->W_out.data[i] = w_orig - EPS;
         float loss_minus = compute_loss(mfm, tokens);
         kmamba_free(mfm);
@@ -343,15 +336,16 @@ int main(void) {
     }
 
     printf("\n  W_out gradient summary:\n");
-    printf("    Non-zero gradients : %d / %d\n", total_nonzero, DIM * STATE);
-    printf("    FD check  PASS     : %d / %d\n", fd_pass, DIM * STATE);
-    printf("    FD check  FAIL     : %d / %d\n", fd_fail, DIM * STATE);
+    printf("    Non-zero gradients : %d / %zu\n", total_nonzero, n_out);
+    printf("    FD check  PASS     : %d / %zu\n", fd_pass, n_out);
+    printf("    FD check  FAIL     : %d / %zu\n", fd_fail, n_out);
 
     if (total_nonzero == 0) {
         printf("\n  [FAIL CRITIQUE] Tous les gradients de W_out sont nuls!\n");
         printf("  -> Le backward ne propage rien depuis l'output.\n");
     }
 
+    free(W_out_ref);
     kmamba_free(m_sgd);
     kmamba_free(m3);
 
