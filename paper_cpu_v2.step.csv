@@ -1,0 +1,1 @@
+run_id,epoch,step_in_epoch,global_step,train_loss,train_ppl,grad_norm,grad_over_clip,would_clip,step_ms,tokens_per_sec,max_rss_kb,bad_loss

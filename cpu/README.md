@@ -12,7 +12,7 @@ ML. Juste du C, de l'assembleur, et libc/libm.
 - CMake ≥ 3.18
 - GCC ≥ 9 (C11)
 - NASM ≥ 2.14
-- ~120 MB de RAM libre
+- ~64 MB de RAM libre
 
 ---
 
@@ -41,26 +41,45 @@ Les outils de diagnostic sont aussi compilés :
 ./build/kmamba_cpu
 
 # Sur un fichier texte
-./build/kmamba_cpu train data/conversations.txt
+./build/kmamba_cpu train ./data/conversations.txt
 
 # Avec sauvegarde de checkpoint
-./build/kmamba_cpu train data/conversations.txt ckpt.bin
+./build/kmamba_cpu train ./data/conversations.txt ckpt.bin
 
-# Reprendre depuis un checkpoint existant
-./build/kmamba_cpu train data/conversations.txt ckpt.bin
+# Avec logs CSV pour le paper
+./build/kmamba_cpu train ./data/conversations.txt ckpt.bin paper_cpu
 ```
+
+L'instance CPU est bornée au budget Chinchilla du modèle
+(`DATASET_BYTES_MAX = 20 x params = 9,941,760 bytes`, soit `~9.48 MiB`)
+et réserve automatiquement `5%` de ce sous-corpus pour la validation.
 
 La progression s'affiche en temps réel :
 
 ```code
- epoch |   loss   |  ms/epoch
--------+----------+-----------
-       step   50/389  loss=5.4821
+ epoch | train_bt | train_ev |   val    |  tok/s   |  ms/epoch
+-------+----------+----------+----------+----------+-----------
+       step   50/389  loss=  5.4821  grad=      0.9321
   ...
-     1 |   5.4712 | 9725000.0
+     1 |   5.4712 |   5.4890 |   5.5034 |    812.0 |  97250.0
 ```
 
-Un checkpoint est sauvegardé automatiquement tous les 10 epochs (`SAVE_EVERY`).
+- `train_bt` = moyenne des losses de batch pendant l'epoch
+- `train_ev` = loss réévaluée sur le split train avec la même fonction que la validation
+- `val` = loss sur le split validation
+
+Un checkpoint est sauvegardé automatiquement à chaque epoch (`SAVE_EVERY=1`).
+
+Si tu passes `paper_cpu` comme préfixe de logs :
+- `paper_cpu.step.csv` contient les métriques par batch
+- `paper_cpu.epoch.csv` contient les métriques agrégées par epoch
+
+Colonnes principales :
+- `train_loss`, `train_eval_loss`, `val_loss`
+- `train_ppl`, `train_eval_ppl`, `val_ppl`
+- `grad_norm`, `grad_over_clip`, `would_clip`
+- `step_ms`, `epoch_ms`, `tokens_per_sec`
+- `param_count`, `param_norm`, `update_norm`, `max_rss_kb`
 
 ### Génération libre
 
@@ -100,26 +119,29 @@ Tous les hyperparamètres sont des `#define` en tête de `main.c` :
 | Paramètre      | Valeur   | Description                                      |
 |----------------|----------|--------------------------------------------------|
 | `VOCAB_SIZE`   | 256      | Vocabulaire byte-level (tous les bytes ASCII)    |
-| `DIM`          | 512      | Dimension des embeddings et des états cachés     |
-| `STATE_SIZE`   | 1024     | Taille de l'état SSM par couche                  |
-| `N_LAYERS`     | 4        | Nombre de MambaBlocks empilés                    |
-| `SEQ_LEN`      | 256      | Longueur de séquence (fenêtre de contexte)       |
-| `BATCH_SIZE`   | 16       | Séquences traitées simultanément                 |
+| `DIM`          | 240      | Dimension des embeddings et des états cachés     |
+| `STATE_SIZE`   | 256      | Taille de l'état SSM par couche                  |
+| `N_LAYERS`     | 3        | Nombre de MambaBlocks empilés                    |
+| `SEQ_LEN`      | 128      | Longueur de séquence (fenêtre de contexte)       |
+| `BATCH_SIZE`   | 64       | Séquences traitées simultanément                 |
 | `N_EPOCHS`     | 50       | Nombre de passes sur les données                 |
-| `LR_BLOCKS`    | 1e-3     | Learning rate des MambaBlocks (AdamW)            |
-| `LR_EMBED_HEAD`| 1e-3     | Learning rate de l'embedding et du LM head       |
+| `LR_BLOCKS`    | 5e-5     | Learning rate des MambaBlocks (AdamW)            |
+| `LR_EMBED_HEAD`| 1e-4     | Learning rate de l'embedding et du LM head       |
 | `WEIGHT_DECAY` | 1e-5     | Régularisation L2                                |
 | `CLIP_NORM`    | 1.0      | Gradient clipping (norme maximale)               |
 | `TEMPERATURE`  | 0.8      | Température de sampling (0=greedy, 1=aléatoire)  |
+| `DATASET_BYTES_MAX` | 9.48 MiB | Budget tokens Chinchilla effectivement lu |
+| `VAL_PERCENT`  | 5        | Pourcentage réservé à la validation              |
+| `VAL_EVAL_STEPS` | 64     | Fenêtres évaluées sur train/validation par epoch |
 | `dt_scale`     | 1.0      | Facteur d'échelle du pas de temps SSM            |
 | `dt_min`       | 0.001    | Borne inférieure de delta (softplus clampé)      |
 | `dt_max`       | 1.0      | Borne supérieure de delta                        |
 | `SEED`         | 42       | Graine aléatoire (init Xavier + sampling)        |
 
 **Empreinte mémoire à ces valeurs :**
-- Paramètres : ~17 MB
-- États optimiseur (×6) : ~102 MB
-- Total : ~119 MB
+- Paramètres : ~1.9 MB
+- États optimiseur persistants : ~5.2 MB
+- Total : ~7 MB
 
 ---
 
@@ -144,7 +166,7 @@ au format du corpus d'entraînement pour que le mode chat fonctionne correctemen
 
 ## Format du checkpoint
 
-Fichier binaire `ckpt.bin`, magic `KMAMBA`, version 1. Contient :
+Fichier binaire `ckpt.bin`, magic `KMAMBA`, version 4. Contient :
 - La configuration du modèle (`KMambaConfig`)
 - Tous les tenseurs de paramètres (float32, row-major)
 - Les états des optimiseurs (moments Adam)
@@ -199,11 +221,14 @@ Voir `../k-mamba/CONTEXT.md` pour l'API complète et les règles d'architecture.
 ## Entraînement long (nohup)
 
 ```bash
-# Lancer en arrière-plan, log dans train.log
-nohup ./build/kmamba_cpu train data/conversations.txt ckpt.bin > train.log 2>&1 &
+# Lancer en arrière-plan, logs stdout + CSV
+nohup ./build/kmamba_cpu train ./data/conversations.txt ckpt.bin paper_cpu > train.log 2>&1 &
 
 # Suivre la progression
 tail -f train.log
+
+# CSV exploitables pour les graphes
+tail -f paper_cpu.epoch.csv
 
 # Arrêter proprement (le checkpoint est sauvegardé à chaque SAVE_EVERY epoch)
 kill <PID>

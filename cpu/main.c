@@ -1,13 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * kmamba_cpu — Instance k-mamba CPU
  *
  * Byte-level language model basé sur k-mamba.
- * Config plafond recommandée pour x86-64 AVX2, ~115 MB RAM.
+ * Config CPU paper : ~500K paramètres, logs CSV et corpus borné.
  *
  * Usage:
  *   ./kmamba_cpu                          # entraîne sur texte intégré, puis génère
- *   ./kmamba_cpu train <data.txt>         # entraîne sur un fichier texte
- *   ./kmamba_cpu train <data.txt> <ckpt>  # entraîne et sauvegarde checkpoint
+ *   ./kmamba_cpu train <data.txt> [ckpt] [log-prefix]
  *   ./kmamba_cpu gen   <ckpt> [prompt]    # génère depuis un checkpoint
  *   ./kmamba_cpu chat  <ckpt>             # REPL interactif (chatbot)
  */
@@ -18,29 +19,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/resource.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ============================================================
- * CONFIG — plafond CPU (x86-64 AVX2)
+ * CONFIG — instance CPU pour courbes paper
  *
- * Config nano — test rapide (~60× plus vite que le plafond)
- * Mémoire totale estimée:
- *   params     : 2 × (2 × 128 × 256) × 4B   =   0.5 MB
- *   embed+head : 2 × 256 × 128        × 4B   =   0.25 MB
- *   optim(×6)  : 6 × 0.5 MB                  =   3 MB
- *   ─────────────────────────────────────────────────────
- *   Total                                     ≈   5 MB
+ * Cible : ~500K paramètres exacts.
+ * Param count réel avec l'architecture k-mamba actuelle :
+ *   embed+head = 2 * vocab * dim
+ *   bloc       = W_in + W_out + A_log + W_B + W_C + b_B + b_C
+ *              + delta_proj + lambda_proj + theta
+ *   total      ≈ 497K paramètres
  * ============================================================ */
 #define VOCAB_SIZE    256
-#define DIM           128
+#define DIM           240
 #define STATE_SIZE    256
 #define N_LAYERS      3
 #define SEQ_LEN       128
 #define BATCH_SIZE    64
-#define N_EPOCHS      200
-#define SAVE_EVERY    10    /* sauvegarde checkpoint tous les N epochs */
-#define LR_BLOCKS     3e-4f
-#define LR_EMBED_HEAD 3e-4f
+#define N_EPOCHS      50
+#define SAVE_EVERY    1     /* sauvegarde checkpoint tous les N epochs */
+#define LR_BLOCKS     5e-5f
+#define LR_EMBED_HEAD 1e-4f
 #define WEIGHT_DECAY  1e-5f
 #define CLIP_NORM     1.0f
 #define MOMENTUM      0.9f
@@ -54,6 +58,16 @@
 #define REPL_YOU      "speaker001"       /* label affiché à l'utilisateur */
 #define REPL_CP       "speaker002"       /* label affiché pour le modèle */
 #define SEED          42
+#define CHINCHILLA_TOKENS_PER_PARAM 20u
+#define BLOCK_PARAM_COUNT_EST \
+    (2u * DIM + STATE_SIZE + 2u * STATE_SIZE * DIM + 2u * STATE_SIZE + 2u * DIM + (STATE_SIZE / 2u))
+#define MODEL_PARAM_COUNT_EST \
+    (N_LAYERS * BLOCK_PARAM_COUNT_EST + 2u * VOCAB_SIZE * DIM)
+#define DATASET_BYTES_MAX (MODEL_PARAM_COUNT_EST * CHINCHILLA_TOKENS_PER_PARAM)
+#define VAL_PERCENT      5u
+#define VAL_EVAL_STEPS   64u
+#define PRINT_EVERY      50u
+#define OMP_THREADS      7
 
 /* ============================================================
  * Texte intégré — fallback si aucun fichier fourni
@@ -90,13 +104,16 @@ typedef struct {
     size_t   len;
 } Dataset;
 
-static Dataset load_file(const char *path) {
+static Dataset load_file_prefix(const char *path, size_t max_bytes, size_t *source_len_out) {
     Dataset ds = {NULL, 0};
+    size_t file_len = 0;
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[erreur] impossible d'ouvrir %s\n", path); return ds; }
     fseek(f, 0, SEEK_END);
-    ds.len = (size_t)ftell(f);
+    file_len = (size_t)ftell(f);
     rewind(f);
+    if (source_len_out) *source_len_out = file_len;
+    ds.len = (max_bytes > 0 && file_len > max_bytes) ? max_bytes : file_len;
     ds.data = (uint8_t *)malloc(ds.len);
     if (!ds.data) { fclose(f); return ds; }
     if (fread(ds.data, 1, ds.len, f) != ds.len) { free(ds.data); ds.data = NULL; ds.len = 0; }
@@ -120,6 +137,190 @@ static void sample_batch(const Dataset *ds, uint8_t *batch, size_t batch_size) {
         size_t start = (size_t)rand() % (max_start + 1);
         memcpy(&batch[b * seq_bytes], &ds->data[start], seq_bytes);
     }
+}
+
+static char *xstrdup_local(const char *s) {
+    size_t n;
+    char *copy;
+    if (!s) return NULL;
+    n = strlen(s) + 1;
+    copy = (char *)malloc(n);
+    if (!copy) return NULL;
+    memcpy(copy, s, n);
+    return copy;
+}
+
+static char *make_log_path(const char *prefix, const char *kind) {
+    size_t n;
+    char *path;
+    if (!prefix || !kind) return NULL;
+    n = strlen(prefix) + 1 + strlen(kind) + 4 + 1;
+    path = (char *)malloc(n);
+    if (!path) return NULL;
+    snprintf(path, n, "%s.%s.csv", prefix, kind);
+    return path;
+}
+
+static FILE *open_csv_log(const char *path, const char *header) {
+    FILE *f;
+    long pos = 0;
+
+    if (!path || !header) return NULL;
+
+    f = fopen(path, "a+");
+    if (!f) {
+        fprintf(stderr, "[warning] impossible d'ouvrir %s\n", path);
+        return NULL;
+    }
+
+    if (fseek(f, 0, SEEK_END) == 0) pos = ftell(f);
+    if (pos == 0) {
+        fprintf(f, "%s\n", header);
+        fflush(f);
+    }
+    return f;
+}
+
+static size_t current_rss_kb(void) {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+    return (size_t)usage.ru_maxrss;
+}
+
+static size_t block_param_count(size_t dim, size_t state_size) {
+    size_t theta_size = state_size / 2;
+    if (theta_size == 0) theta_size = 1;
+    return 2 * dim
+         + state_size
+         + 2 * state_size * dim
+         + 2 * state_size
+         + 2 * dim
+         + theta_size;
+}
+
+static size_t model_param_count(size_t vocab_size, size_t dim,
+                                size_t state_size, size_t n_layers) {
+    return n_layers * block_param_count(dim, state_size)
+         + 2 * vocab_size * dim;
+}
+
+static size_t append_tensor(float *dst, size_t offset,
+                            const float *src, size_t n) {
+    if (dst && src && n > 0) memcpy(dst + offset, src, n * sizeof(float));
+    return offset + n;
+}
+
+static size_t kmamba_flatten_params(const KMamba *m, float *dst) {
+    size_t offset = 0;
+
+    if (!m) return 0;
+
+    offset = append_tensor(dst, offset, m->embedding, m->cfg.vocab_size * m->cfg.dim);
+    offset = append_tensor(dst, offset, m->head,      m->cfg.dim * m->cfg.vocab_size);
+
+    for (size_t i = 0; i < m->cfg.n_layers; i++) {
+        const MambaBlock *b = m->layers[i];
+        size_t theta_size = b->config.state_size / 2;
+        if (theta_size == 0) theta_size = 1;
+
+        offset = append_tensor(dst, offset, b->W_in.data,       b->W_in.rows * b->W_in.cols);
+        offset = append_tensor(dst, offset, b->W_out.data,      b->W_out.rows * b->W_out.cols);
+        offset = append_tensor(dst, offset, b->A_log.data,      b->A_log.rows * b->A_log.cols);
+        offset = append_tensor(dst, offset, b->W_B.data,        b->W_B.rows * b->W_B.cols);
+        offset = append_tensor(dst, offset, b->W_C.data,        b->W_C.rows * b->W_C.cols);
+        offset = append_tensor(dst, offset, b->b_B,             b->config.state_size);
+        offset = append_tensor(dst, offset, b->b_C,             b->config.state_size);
+        offset = append_tensor(dst, offset, b->delta_proj.data, b->delta_proj.rows * b->delta_proj.cols);
+        offset = append_tensor(dst, offset, b->lambda_proj.data, b->lambda_proj.rows * b->lambda_proj.cols);
+        offset = append_tensor(dst, offset, b->theta,           theta_size);
+    }
+
+    return offset;
+}
+
+static float l2_norm_f32(const float *x, size_t n) {
+    double acc = 0.0;
+    if (!x) return 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        double v = (double)x[i];
+        acc += v * v;
+    }
+    return sqrtf((float)acc);
+}
+
+static float l2_diff_norm_f32(const float *a, const float *b, size_t n) {
+    double acc = 0.0;
+    if (!a || !b) return 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        double d = (double)a[i] - (double)b[i];
+        acc += d * d;
+    }
+    return sqrtf((float)acc);
+}
+
+static float safe_perplexity(float loss) {
+    if (!isfinite(loss)) return NAN;
+    if (loss > 20.0f) loss = 20.0f;
+    return expf(loss);
+}
+
+static float compute_loss_from_logits(const float *logits,
+                                      const uint8_t *targets,
+                                      size_t seq_len,
+                                      size_t vocab_size) {
+    float loss = 0.0f;
+
+    for (size_t t = 0; t < seq_len; t++) {
+        const float *row = &logits[t * vocab_size];
+        float maxv = row[0];
+        float sum = 0.0f;
+
+        for (size_t v = 1; v < vocab_size; v++)
+            if (row[v] > maxv) maxv = row[v];
+        for (size_t v = 0; v < vocab_size; v++)
+            sum += expf(row[v] - maxv);
+
+        {
+            float p = expf(row[(size_t)targets[t]] - maxv) / sum;
+            if (p < 1e-20f) p = 1e-20f;
+            loss += -logf(p);
+        }
+    }
+
+    return loss / (float)seq_len;
+}
+
+static float evaluate_dataset(KMamba *m, const Dataset *ds, size_t max_windows) {
+    size_t seq_bytes;
+    size_t available;
+    size_t windows;
+    size_t stride;
+    float *logits;
+    float loss_sum = 0.0f;
+
+    if (!m || !ds || !ds->data) return NAN;
+
+    seq_bytes = m->cfg.seq_len + 1;
+    if (ds->len < seq_bytes) return NAN;
+
+    available = ds->len - seq_bytes + 1;
+    windows = available < max_windows ? available : max_windows;
+    if (windows == 0) windows = 1;
+    stride = windows > 1 ? (available - 1) / (windows - 1) : 0;
+
+    logits = (float *)malloc(m->cfg.seq_len * m->cfg.vocab_size * sizeof(float));
+    if (!logits) return NAN;
+
+    for (size_t i = 0; i < windows; i++) {
+        size_t start = i * stride;
+        const uint8_t *window = &ds->data[start];
+        kmamba_forward(m, window, logits);
+        loss_sum += compute_loss_from_logits(logits, window + 1,
+                                             m->cfg.seq_len, m->cfg.vocab_size);
+    }
+
+    free(logits);
+    return loss_sum / (float)windows;
 }
 
 /* ============================================================
@@ -277,8 +478,15 @@ static void chat_repl(KMamba *m) {
  * Affichage
  * ============================================================ */
 static void print_config(void) {
+    size_t total_params = model_param_count(VOCAB_SIZE, DIM, STATE_SIZE, N_LAYERS);
+    size_t embed_head_params = 2 * VOCAB_SIZE * DIM;
+    size_t block_params_total = N_LAYERS * block_param_count(DIM, STATE_SIZE);
+    size_t optimizer_params = 3 * block_params_total + 2 * embed_head_params;
+    float  mem_params_mb = (float)(total_params * sizeof(float)) / (1024.0f * 1024.0f);
+    float  mem_optim_mb = (float)(optimizer_params * sizeof(float)) / (1024.0f * 1024.0f);
+
     printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║         k-mamba — Instance CPU (AVX2)           ║\n");
+    printf("║         k-mamba — Instance CPU (AVX2)            ║\n");
     printf("╠══════════════════════════════════════════════════╣\n");
     printf("║  vocab_size  : %-5d                            ║\n", VOCAB_SIZE);
     printf("║  dim         : %-5d                            ║\n", DIM);
@@ -287,13 +495,12 @@ static void print_config(void) {
     printf("║  seq_len     : %-5d                            ║\n", SEQ_LEN);
     printf("║  batch_size  : %-5d                            ║\n", BATCH_SIZE);
     printf("║  epochs      : %-5d                            ║\n", N_EPOCHS);
+    printf("║  omp threads : %-5d                            ║\n", OMP_THREADS);
     printf("╠══════════════════════════════════════════════════╣\n");
-    size_t params_per_block = 2 * DIM * STATE_SIZE + 3 * STATE_SIZE + DIM;
-    size_t total_params = N_LAYERS * params_per_block + 2 * VOCAB_SIZE * DIM;
-    float  mem_params_mb = (float)(total_params * sizeof(float)) / (1024.0f * 1024.0f);
-    float  mem_optim_mb  = mem_params_mb * 6.0f;
     printf("║  params      : %7.0fK                          ║\n",
            (float)total_params / 1000.0f);
+    printf("║  corpus max  : %5.1f MiB                        ║\n",
+           (float)DATASET_BYTES_MAX / (1024.0f * 1024.0f));
     printf("║  mémoire     : params %.1f MB + optim %.1f MB   ║\n",
            mem_params_mb, mem_optim_mb);
     printf("║  total ~     : %.0f MB                           ║\n",
@@ -312,6 +519,11 @@ static double elapsed_ms(struct timespec *t0) {
  * main
  * ============================================================ */
 int main(int argc, char *argv[]) {
+    const size_t seq_bytes = (size_t)(SEQ_LEN + 1);
+#ifdef _OPENMP
+    omp_set_dynamic(0);
+    omp_set_num_threads(OMP_THREADS);
+#endif
     srand(SEED);
     print_config();
 
@@ -320,6 +532,7 @@ int main(int argc, char *argv[]) {
     const char *data_path  = NULL;
     const char *ckpt_path  = NULL;
     const char *prompt_str = NULL;
+    const char *log_prefix_arg = NULL;
 
     if (argc >= 2 && strcmp(argv[1], "chat") == 0) {
         ckpt_path = argc >= 3 ? argv[2] : NULL;
@@ -338,6 +551,7 @@ int main(int argc, char *argv[]) {
     } else if (argc >= 2 && strcmp(argv[1], "train") == 0) {
         data_path = argc >= 3 ? argv[2] : NULL;
         ckpt_path = argc >= 4 ? argv[3] : NULL;
+        log_prefix_arg = argc >= 5 ? argv[4] : NULL;
     } else if (argc == 2) {
         data_path = argv[1];
     }
@@ -354,21 +568,47 @@ int main(int argc, char *argv[]) {
 
     /* --- Chargement des données --- */
     Dataset ds;
+    Dataset train_ds = {NULL, 0};
+    Dataset val_ds = {NULL, 0};
+    size_t source_len = 0;
+    size_t val_len = 0;
     if (data_path) {
-        ds = load_file(data_path);
+        ds = load_file_prefix(data_path, DATASET_BYTES_MAX, &source_len);
         if (!ds.data) return 1;
-        printf("[données] %s — %zu bytes\n\n", data_path, ds.len);
+        printf("[données] %s — %zu / %zu bytes utilisés\n",
+               data_path, ds.len, source_len);
+        if (source_len > ds.len) {
+            printf("[corpus] instance CPU bornée aux %zu premiers bytes (%.1f MiB)\n",
+                   ds.len, (float)ds.len / (1024.0f * 1024.0f));
+        }
     } else {
         ds = from_string(BUILTIN_TEXT);
         printf("[données] texte intégré — %zu bytes\n", ds.len);
-        printf("(passer un fichier .txt en argument pour entraîner sur vos données)\n\n");
+        printf("(passer un fichier .txt en argument pour entraîner sur vos données)\n");
     }
 
-    if (ds.len < (size_t)(SEQ_LEN + 1)) {
+    if (ds.len < seq_bytes) {
         fprintf(stderr, "[erreur] données trop courtes (%zu bytes, besoin de %d)\n",
                 ds.len, SEQ_LEN + 1);
         free(ds.data);
         return 1;
+    }
+
+    if (ds.len >= 20 * seq_bytes) {
+        val_len = (ds.len * VAL_PERCENT) / 100u;
+        if (val_len < seq_bytes) val_len = seq_bytes;
+        if (val_len >= ds.len) val_len = 0;
+    }
+
+    train_ds = ds;
+    if (val_len > 0 && ds.len > val_len + seq_bytes) {
+        train_ds.len = ds.len - val_len;
+        val_ds.data = ds.data + train_ds.len;
+        val_ds.len = val_len;
+        printf("[split] train=%zu bytes | val=%zu bytes (%u%%)\n\n",
+               train_ds.len, val_ds.len, VAL_PERCENT);
+    } else {
+        printf("[split] train seul (validation désactivée, corpus trop court)\n\n");
     }
 
     /* --- Création du modèle --- */
@@ -399,42 +639,150 @@ int main(int argc, char *argv[]) {
         printf("[modèle initialisé (Xavier, seed=%d)]\n\n", SEED);
     }
 
+    size_t total_params = kmamba_flatten_params(m, NULL);
+    char *owned_log_prefix = NULL;
+    const char *log_prefix = log_prefix_arg;
+    char *step_log_path = NULL;
+    char *epoch_log_path = NULL;
+    FILE *step_log = NULL;
+    FILE *epoch_log = NULL;
+    float *prev_params = NULL;
+    float *curr_params = NULL;
+    unsigned long long run_id = (unsigned long long)time(NULL);
+
+    if (!log_prefix) {
+        owned_log_prefix = xstrdup_local(ckpt_path ? ckpt_path : "kmamba_cpu");
+        log_prefix = owned_log_prefix;
+    }
+    step_log_path = make_log_path(log_prefix, "step");
+    epoch_log_path = make_log_path(log_prefix, "epoch");
+    step_log = open_csv_log(step_log_path,
+        "run_id,epoch,step_in_epoch,global_step,train_loss,train_ppl,grad_norm,grad_over_clip,would_clip,step_ms,tokens_per_sec,max_rss_kb,bad_loss");
+    epoch_log = open_csv_log(epoch_log_path,
+        "run_id,epoch,steps_in_epoch,total_tokens,train_loss,train_ppl,train_eval_loss,train_eval_ppl,val_loss,val_ppl,grad_norm_last,grad_over_clip_last,would_clip_last,epoch_ms,step_ms_avg,tokens_per_sec,param_count,param_norm,update_norm,max_rss_kb,train_bytes,val_bytes");
+    if (step_log) setvbuf(step_log, NULL, _IOLBF, 0);
+    if (epoch_log) setvbuf(epoch_log, NULL, _IOLBF, 0);
+    if (step_log || epoch_log) {
+        printf("[logs] step=%s | epoch=%s\n\n",
+               step_log_path ? step_log_path : "(désactivé)",
+               epoch_log_path ? epoch_log_path : "(désactivé)");
+    }
+
+    prev_params = (float *)malloc(total_params * sizeof(float));
+    curr_params = (float *)malloc(total_params * sizeof(float));
+    if (!prev_params || !curr_params) {
+        fprintf(stderr, "[erreur] impossible d'allouer les snapshots de paramètres\n");
+        free(ds.data);
+        free(owned_log_prefix);
+        free(step_log_path);
+        free(epoch_log_path);
+        if (step_log) fclose(step_log);
+        if (epoch_log) fclose(epoch_log);
+        kmamba_free(m);
+        free(prev_params);
+        free(curr_params);
+        return 1;
+    }
+    kmamba_flatten_params(m, prev_params);
+
     /* --- Boucle d'entraînement --- */
-    uint8_t *batch = (uint8_t *)malloc((size_t)BATCH_SIZE * (SEQ_LEN + 1));
-    size_t steps_per_epoch = (ds.len / ((size_t)(SEQ_LEN + 1) * BATCH_SIZE));
+    uint8_t *batch = (uint8_t *)malloc((size_t)BATCH_SIZE * seq_bytes);
+    size_t steps_per_epoch = (train_ds.len / (seq_bytes * BATCH_SIZE));
+    size_t global_step = 0;
     if (steps_per_epoch < 1) steps_per_epoch = 1;
 
     printf("entraînement : %d epochs × %zu steps × batch=%d\n\n",
            N_EPOCHS, steps_per_epoch, BATCH_SIZE);
-    printf(" epoch |   loss   |  ms/epoch\n");
-    printf("-------+----------+-----------\n");
+    printf(" epoch | train_bt | train_ev |   val    |  tok/s   |  ms/epoch\n");
+    printf("-------+----------+----------+----------+----------+-----------\n");
     fflush(stdout);
 
     for (int epoch = 1; epoch <= N_EPOCHS; epoch++) {
         struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         float loss_sum = 0.0f;
+        double step_ms_sum = 0.0;
+        int bad_loss = 0;
 
         for (size_t s = 0; s < steps_per_epoch; s++) {
-            sample_batch(&ds, batch, BATCH_SIZE);
-            loss_sum += kmamba_train_batch(m, batch, BATCH_SIZE);
-            if ((s + 1) % 50 == 0 || s + 1 == steps_per_epoch) {
-                printf("       step %4zu/%zu  loss=%.4f\r",
-                       s + 1, steps_per_epoch, loss_sum / (float)(s + 1));
+            struct timespec step_t0;
+            double step_ms;
+            double step_tokens_s;
+            float batch_loss;
+            clock_gettime(CLOCK_MONOTONIC, &step_t0);
+            sample_batch(&train_ds, batch, BATCH_SIZE);
+            batch_loss = kmamba_train_batch(m, batch, BATCH_SIZE);
+            step_ms = elapsed_ms(&step_t0);
+            step_tokens_s = step_ms > 0.0
+                ? ((double)BATCH_SIZE * (double)SEQ_LEN * 1000.0) / step_ms
+                : 0.0;
+
+            global_step++;
+            loss_sum += batch_loss;
+            step_ms_sum += step_ms;
+            if (!isfinite(batch_loss)) bad_loss = 1;
+
+            if (step_log) {
+                fprintf(step_log, "%llu,%d,%zu,%zu,%.6f,%.6f,%.6f,%.6f,%d,%.3f,%.3f,%zu,%d\n",
+                        run_id, epoch, s + 1, global_step,
+                        batch_loss, safe_perplexity(batch_loss),
+                        m->last_grad_norm, m->last_grad_over_clip, m->last_grad_would_clip,
+                        step_ms, step_tokens_s, current_rss_kb(), bad_loss);
+            }
+
+            if ((s + 1) % PRINT_EVERY == 0 || s + 1 == steps_per_epoch) {
+                printf("       step %4zu/%zu  loss=%8.4f  grad=%12.4f      \r",
+                       s + 1, steps_per_epoch,
+                       loss_sum / (float)(s + 1), m->last_grad_norm);
                 fflush(stdout);
             }
         }
         printf("\n");
 
         double ms = elapsed_ms(&t0);
+        double step_ms_avg = steps_per_epoch > 0 ? step_ms_sum / (double)steps_per_epoch : 0.0;
+        double tokens_total = (double)steps_per_epoch * (double)BATCH_SIZE * (double)SEQ_LEN;
+        double tokens_s = ms > 0.0 ? (tokens_total * 1000.0) / ms : 0.0;
         float  avg_loss = loss_sum / (float)steps_per_epoch;
-        printf("  %4d | %8.4f | %8.1f\n", epoch, avg_loss, ms);
+        float  train_eval_loss = (train_ds.len >= seq_bytes)
+                               ? evaluate_dataset(m, &train_ds, VAL_EVAL_STEPS)
+                               : NAN;
+        float  val_loss = (val_ds.len >= seq_bytes)
+                        ? evaluate_dataset(m, &val_ds, VAL_EVAL_STEPS)
+                        : NAN;
+        float  param_norm;
+        float  update_norm;
+
+        kmamba_flatten_params(m, curr_params);
+        param_norm = l2_norm_f32(curr_params, total_params);
+        update_norm = l2_diff_norm_f32(curr_params, prev_params, total_params);
+        memcpy(prev_params, curr_params, total_params * sizeof(float));
+
+        printf("  %4d | %8.4f | %8.4f | %8.4f | %8.0f | %8.1f\n",
+               epoch, avg_loss, train_eval_loss, val_loss, tokens_s, ms);
         fflush(stdout);
+
+        if (epoch_log) {
+            fprintf(epoch_log,
+                    "%llu,%d,%zu,%.0f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.3f,%.3f,%.3f,%zu,%.6f,%.6f,%zu,%zu,%zu\n",
+                    run_id, epoch, steps_per_epoch, tokens_total,
+                    avg_loss, safe_perplexity(avg_loss),
+                    train_eval_loss, safe_perplexity(train_eval_loss),
+                    val_loss, safe_perplexity(val_loss),
+                    m->last_grad_norm, m->last_grad_over_clip, m->last_grad_would_clip,
+                    ms, step_ms_avg, tokens_s,
+                    total_params, param_norm, update_norm,
+                    current_rss_kb(), train_ds.len, val_ds.len);
+        }
 
         /* Checkpoint périodique */
         if (ckpt_path && epoch % SAVE_EVERY == 0) {
             kmamba_save(m, ckpt_path);
             printf("         [checkpoint sauvegardé : %s]\n", ckpt_path);
+        }
+
+        if (bad_loss) {
+            printf("         [warning] loss non finie détectée pendant l'epoch %d\n", epoch);
         }
     }
 
@@ -446,8 +794,15 @@ int main(int argc, char *argv[]) {
     /* --- Génération démonstrative --- */
     generate(m, "Les systemes", GEN_LEN);
 
+    if (step_log) fclose(step_log);
+    if (epoch_log) fclose(epoch_log);
     kmamba_free(m);
     free(ds.data);
     free(batch);
+    free(prev_params);
+    free(curr_params);
+    free(owned_log_prefix);
+    free(step_log_path);
+    free(epoch_log_path);
     return 0;
 }

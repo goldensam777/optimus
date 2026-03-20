@@ -1,5 +1,5 @@
 /*
- * main.cu — Instance GPU (MX450 / sm_75)
+ * main.c — Instance GPU (MX450 / sm_75)
  *
  * Architecture : TOUT sur GPU.
  *   embed   : lookup sur GPU
@@ -22,7 +22,6 @@
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
-#include <sys/resource.h>
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -34,17 +33,13 @@
 #define DIM           256
 #define STATE_SIZE    512
 #define N_LAYERS      5
-#define MIMO_RANK     1
 #define SEQ_LEN       256
-#define BATCH_SIZE    64
-#define N_EPOCHS      1000
+#define BATCH_SIZE    32
+#define N_EPOCHS      200
 #define SAVE_EVERY    5
-#define VAL_PERCENT   5
-#define VAL_EVAL_STEPS 32
-#define PRINT_EVERY   50
 
-#define LR_BLOCKS     1e-4f
-#define LR_EMBED_HEAD 1e-4f
+#define LR_BLOCKS     2e-4f
+#define LR_EMBED_HEAD 2e-4f
 #define WEIGHT_DECAY  1e-5f
 #define CLIP_NORM     1.0f
 #define MOMENTUM      0.9f
@@ -62,38 +57,35 @@ extern "C" {
 void gpu_block_forward(
     cublasHandle_t cublas,
     const float *d_W_in, const float *d_W_out,
-    const float *d_A_log, const float *d_W_B, const float *d_W_C,
-    const float *d_delta_proj, const float *d_theta, const float *d_lambda_proj,
+    const float *d_A_log, const float *d_B_mat, const float *d_C_mat,
+    const float *d_delta_proj,
     const float *d_x, float *d_y,
     float *d_u_raw, float *d_u,
     float *d_dt_raw, float *d_dt,
     float *d_B_exp, float *d_C_exp, float *d_dt_exp,
     float *d_h_store, float *d_y_scan, float *d_y_proj,
-    float *d_lambda_raw, float *d_lambda,
-    int L, int state, int dim, int R);
+    int L, int state, int dim);
 
 void gpu_block_backward(
     cublasHandle_t cublas,
     const float *d_W_in, const float *d_W_out,
     const float *d_A_log,
-    const float *d_W_B, const float *d_W_C,
-    const float *d_delta_proj, const float *d_theta, const float *d_lambda_proj,
+    const float *d_B_mat, const float *d_C_mat,
+    const float *d_delta_proj,
     const float *d_x,
     const float *d_u_raw, const float *d_u,
     const float *d_dt_raw, const float *d_dt,
     const float *d_B_exp, const float *d_C_exp, const float *d_dt_exp,
     const float *d_h_store, const float *d_y_scan,
-    const float *d_lambda,
     const float *d_dy,
     float *d_dW_in, float *d_dW_out, float *d_dA_log,
-    float *d_dW_B, float *d_dW_C, float *d_ddelta_proj,
-    float *d_g_theta, float *d_g_lambda_proj,
+    float *d_dB_mat, float *d_dC_mat, float *d_ddelta_proj,
     float *d_dx,
     float *d_dy_scan, float *d_du, float *d_du_raw,
     float *d_ddt, float *d_ddt_raw,
     float *d_dB_scan, float *d_dC_scan, float *d_ddt_scan,
-    float *d_dA_tmp, float *d_dlambda, float *d_dlambda_raw,
-    int L, int state, int dim, int R);
+    float *d_dA_tmp,
+    int L, int state, int dim);
 
 #ifdef __cplusplus
 }
@@ -112,22 +104,16 @@ void gpu_block_backward(
 typedef struct {
     /* Paramètres */
     float *W_in,  *W_out;
-    float *A_log, *W_B, *W_C;
+    float *A_log, *B_mat, *C_mat;
     float *delta_proj;
-    float *theta;          /* [state/2] rotation angles */
-    float *lambda_proj;    /* [dim] exp-trapezoidal lambda projection */
     /* Gradients */
     float *g_W_in,  *g_W_out;
-    float *g_A_log, *g_W_B, *g_W_C;
+    float *g_A_log, *g_B_mat, *g_C_mat;
     float *g_delta_proj;
-    float *g_theta;        /* [state/2] */
-    float *g_lambda_proj;  /* [dim] */
     /* Momentum (MUON) */
     float *m_W_in,  *m_W_out;
-    float *m_A_log, *m_W_B, *m_W_C;
+    float *m_A_log, *m_B_mat, *m_C_mat;
     float *m_delta_proj;
-    float *m_lambda_proj;  /* [dim] */
-    float *m_theta;        /* [state/2] */
     /* Variance (AdamW pour embed/head) */
     float *v_W_in,  *v_W_out;
 } GpuBlock;
@@ -138,13 +124,11 @@ typedef struct {
     float *dt_raw, *dt;
     float *B_exp, *C_exp, *dt_exp;
     float *h_store, *y_scan, *y_proj;
-    float *lambda_raw, *lambda;  /* [L] for exp-trapezoidal */
     /* backward */
     float *dy_scan, *du, *du_raw;
     float *ddt, *ddt_raw;
     float *dB_scan, *dC_scan, *ddt_scan;
     float *dA_tmp;
-    float *dlambda, *dlambda_raw;  /* [L] */
     /* input de la couche sauvé pour backward */
     float *layer_input;
 } GpuWorkspace;
@@ -173,11 +157,6 @@ typedef struct {
     cublasHandle_t cublas;
     size_t step;
 } GpuModel;
-
-typedef struct {
-    uint8_t *data;
-    size_t len;
-} Dataset;
 
 /* ── Kernels GPU pour embed, loss ────────────────────────────── */
 
@@ -240,165 +219,13 @@ static __global__ void softmax_ce_kernel(
 /* ── Utilitaires ─────────────────────────────────────────────── */
 
 static float *gpu_alloc(size_t n) {
-    float *p; CUDA_CHECK(cudaMalloc((void**)&p, n * sizeof(float))); return p;
+    float *p; CUDA_CHECK(cudaMalloc(&p, n * sizeof(float))); return p;
 }
 static int *gpu_alloc_int(size_t n) {
-    int *p; CUDA_CHECK(cudaMalloc((void**)&p, n * sizeof(int))); return p;
+    int *p; CUDA_CHECK(cudaMalloc(&p, n * sizeof(int))); return p;
 }
 static void gpu_zero(float *p, size_t n) {
     CUDA_CHECK(cudaMemset(p, 0, n * sizeof(float)));
-}
-
-static float safe_perplexity(float loss) {
-    if (!isfinite(loss)) return NAN;
-    if (loss > 20.0f) loss = 20.0f;
-    return expf(loss);
-}
-
-static char *xstrdup_local(const char *s) {
-    size_t n;
-    char *copy;
-    if (!s) return NULL;
-    n = strlen(s) + 1;
-    copy = (char *)malloc(n);
-    if (!copy) return NULL;
-    memcpy(copy, s, n);
-    return copy;
-}
-
-static char *make_log_path(const char *prefix, const char *kind) {
-    size_t n;
-    char *path;
-    if (!prefix || !kind) return NULL;
-    n = strlen(prefix) + 1 + strlen(kind) + 4 + 1;
-    path = (char *)malloc(n);
-    if (!path) return NULL;
-    snprintf(path, n, "%s.%s.csv", prefix, kind);
-    return path;
-}
-
-static FILE *open_csv_log(const char *path, const char *header) {
-    FILE *f;
-    long pos = 0;
-
-    if (!path || !header) return NULL;
-
-    f = fopen(path, "a+");
-    if (!f) {
-        fprintf(stderr, "[warning] impossible d'ouvrir %s\n", path);
-        return NULL;
-    }
-
-    if (fseek(f, 0, SEEK_END) == 0) pos = ftell(f);
-    if (pos == 0) {
-        fprintf(f, "%s\n", header);
-        fflush(f);
-    }
-    return f;
-}
-
-static size_t current_rss_kb(void) {
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
-    return (size_t)usage.ru_maxrss;
-}
-
-static size_t current_gpu_mem_used_mb(void) {
-    size_t free_b = 0;
-    size_t total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
-    return (total_b - free_b) / (1024u * 1024u);
-}
-
-static double elapsed_ms(const struct timespec *t0) {
-    struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    return (double)(t1.tv_sec - t0->tv_sec) * 1000.0
-         + (double)(t1.tv_nsec - t0->tv_nsec) / 1.0e6;
-}
-
-static float l2_norm_f32(const float *a, size_t n) {
-    double acc = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        double v = (double)a[i];
-        acc += v * v;
-    }
-    return sqrtf((float)acc);
-}
-
-static float l2_diff_norm_f32(const float *a, const float *b, size_t n) {
-    double acc = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        double d = (double)a[i] - (double)b[i];
-        acc += d * d;
-    }
-    return sqrtf((float)acc);
-}
-
-static size_t theta_size_for_state(size_t state_size) {
-    size_t theta_size = state_size / 2;
-    if (theta_size == 0) theta_size = 1;
-    return theta_size;
-}
-
-static size_t block_param_count(size_t dim, size_t state_size, size_t mimo_rank) {
-    size_t theta_size = theta_size_for_state(state_size);
-    size_t nr = state_size * mimo_rank;
-    return mimo_rank * dim          /* W_in */
-         + dim * mimo_rank          /* W_out */
-         + state_size               /* A_log */
-         + nr * dim                 /* W_B */
-         + nr * dim                 /* W_C */
-         + dim                      /* delta_proj */
-         + theta_size               /* theta */
-         + dim;                     /* lambda_proj */
-}
-
-static size_t model_param_count(size_t vocab_size, size_t dim,
-                                size_t state_size, size_t n_layers,
-                                size_t mimo_rank) {
-    return 2 * vocab_size * dim
-         + n_layers * block_param_count(dim, state_size, mimo_rank);
-}
-
-static size_t append_param_from_gpu(float *dst, size_t offset,
-                                    const float *d_src, size_t n) {
-    if (dst && d_src && n > 0) {
-        CUDA_CHECK(cudaMemcpy(dst + offset, d_src, n * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-    }
-    return offset + n;
-}
-
-static size_t gpu_model_flatten_params(const GpuModel *m, float *dst) {
-    size_t offset = 0;
-    size_t V, D, S, R, TS, NR;
-
-    if (!m) return 0;
-
-    V = (size_t)m->vocab;
-    D = (size_t)m->dim;
-    S = (size_t)m->state;
-    R = (size_t)MIMO_RANK;
-    TS = theta_size_for_state(S);
-    NR = S * R;
-
-    offset = append_param_from_gpu(dst, offset, m->d_embed, V * D);
-    offset = append_param_from_gpu(dst, offset, m->d_head,  V * D);
-
-    for (int i = 0; i < m->n_layers; i++) {
-        const GpuBlock *b = &m->blocks[i];
-        offset = append_param_from_gpu(dst, offset, b->W_in,        R * D);
-        offset = append_param_from_gpu(dst, offset, b->W_out,       D * R);
-        offset = append_param_from_gpu(dst, offset, b->A_log,       S);
-        offset = append_param_from_gpu(dst, offset, b->W_B,         NR * D);
-        offset = append_param_from_gpu(dst, offset, b->W_C,         NR * D);
-        offset = append_param_from_gpu(dst, offset, b->delta_proj,  D);
-        offset = append_param_from_gpu(dst, offset, b->theta,       TS);
-        offset = append_param_from_gpu(dst, offset, b->lambda_proj, D);
-    }
-
-    return offset;
 }
 
 /* Xavier init sur CPU, copie sur GPU */
@@ -457,8 +284,6 @@ static GpuModel *gpu_model_create(void) {
     CUBLAS_CHECK(cublasCreate(&m->cublas));
 
     int V = m->vocab, D = m->dim, S = m->state, L = m->seq_len;
-    int R = MIMO_RANK;
-    int NR = S * R;
 
     /* Embedding + head */
     m->d_embed   = gpu_alloc(V * D); m->d_g_embed = gpu_alloc(V * D);
@@ -476,45 +301,37 @@ static GpuModel *gpu_model_create(void) {
         GpuBlock     *b = &m->blocks[i];
         GpuWorkspace *w = &m->ws[i];
 
-        int TS = S / 2; if (TS < 1) TS = 1; /* theta size = state/2 */
-        b->W_in  = gpu_alloc(R * D); b->g_W_in  = gpu_alloc(R * D);
-        b->m_W_in= gpu_alloc(R * D); b->v_W_in  = gpu_alloc(R * D);
-        b->W_out = gpu_alloc(D * R); b->g_W_out = gpu_alloc(D * R);
-        b->m_W_out= gpu_alloc(D*R);  b->v_W_out = gpu_alloc(D * R);
+        b->W_in  = gpu_alloc(S * D); b->g_W_in  = gpu_alloc(S * D);
+        b->m_W_in= gpu_alloc(S * D); b->v_W_in  = gpu_alloc(S * D);
+        b->W_out = gpu_alloc(D * S); b->g_W_out = gpu_alloc(D * S);
+        b->m_W_out= gpu_alloc(D*S);  b->v_W_out = gpu_alloc(D * S);
         b->A_log = gpu_alloc(S);     b->g_A_log = gpu_alloc(S);
         b->m_A_log= gpu_alloc(S);
-        b->W_B   = gpu_alloc(NR*D);  b->g_W_B   = gpu_alloc(NR*D);
-        b->m_W_B = gpu_alloc(NR*D);
-        b->W_C   = gpu_alloc(NR*D);  b->g_W_C   = gpu_alloc(NR*D);
-        b->m_W_C = gpu_alloc(NR*D);
+        b->B_mat = gpu_alloc(S);     b->g_B_mat = gpu_alloc(S);
+        b->m_B_mat= gpu_alloc(S);
+        b->C_mat = gpu_alloc(S);     b->g_C_mat = gpu_alloc(S);
+        b->m_C_mat= gpu_alloc(S);
         b->delta_proj = gpu_alloc(D); b->g_delta_proj = gpu_alloc(D);
         b->m_delta_proj = gpu_alloc(D);
-        b->theta       = gpu_alloc(TS);  b->g_theta       = gpu_alloc(TS);
-        b->m_theta     = gpu_alloc(TS);
-        b->lambda_proj = gpu_alloc(D);   b->g_lambda_proj = gpu_alloc(D);
-        b->m_lambda_proj = gpu_alloc(D);
 
         /* Zéro des moments */
-        gpu_zero(b->m_W_in, R*D); gpu_zero(b->v_W_in, R*D);
-        gpu_zero(b->m_W_out, D*R); gpu_zero(b->v_W_out, D*R);
-        gpu_zero(b->m_A_log, S); gpu_zero(b->m_W_B, NR*D);
-        gpu_zero(b->m_W_C, NR*D); gpu_zero(b->m_delta_proj, D);
-        gpu_zero(b->m_theta, TS); gpu_zero(b->m_lambda_proj, D);
+        gpu_zero(b->m_W_in, S*D); gpu_zero(b->v_W_in, S*D);
+        gpu_zero(b->m_W_out, D*S); gpu_zero(b->v_W_out, D*S);
+        gpu_zero(b->m_A_log, S); gpu_zero(b->m_B_mat, S);
+        gpu_zero(b->m_C_mat, S); gpu_zero(b->m_delta_proj, D);
 
         /* Workspace forward */
-        w->u_raw    = gpu_alloc(L * R); w->u       = gpu_alloc(L * R);
+        w->u_raw    = gpu_alloc(L * S); w->u       = gpu_alloc(L * S);
         w->dt_raw   = gpu_alloc(L);     w->dt      = gpu_alloc(L);
-        w->B_exp    = gpu_alloc(L * NR); w->C_exp   = gpu_alloc(L * NR);
-        w->dt_exp   = gpu_alloc(L * NR); w->h_store = gpu_alloc(L * S);
-        w->y_scan   = gpu_alloc(L * R);  w->y_proj  = gpu_alloc(L * D);
+        w->B_exp    = gpu_alloc(L * S); w->C_exp   = gpu_alloc(L * S);
+        w->dt_exp   = gpu_alloc(L * S); w->h_store = gpu_alloc(L * S);
+        w->y_scan   = gpu_alloc(L * S); w->y_proj  = gpu_alloc(L * D);
         /* Workspace backward */
-        w->dy_scan  = gpu_alloc(L * R);  w->du      = gpu_alloc(L * R);
-        w->du_raw   = gpu_alloc(L * R);  w->ddt     = gpu_alloc(L);
+        w->dy_scan  = gpu_alloc(L * S); w->du      = gpu_alloc(L * S);
+        w->du_raw   = gpu_alloc(L * S); w->ddt     = gpu_alloc(L);
         w->ddt_raw  = gpu_alloc(L);
-        w->dB_scan  = gpu_alloc(L * NR); w->dC_scan = gpu_alloc(L * NR);
+        w->dB_scan  = gpu_alloc(L * S); w->dC_scan = gpu_alloc(L * S);
         w->ddt_scan = gpu_alloc(L * S); w->dA_tmp  = gpu_alloc(S);
-        w->dlambda      = gpu_alloc(L); w->dlambda_raw = gpu_alloc(L);
-        w->lambda_raw   = gpu_alloc(L); w->lambda      = gpu_alloc(L);
         /* Input de chaque couche (sauvé pour backward) */
         w->layer_input = gpu_alloc(L * D);
     }
@@ -524,8 +341,8 @@ static GpuModel *gpu_model_create(void) {
     m->d_dy      = gpu_alloc(L * D);
     m->d_logits  = gpu_alloc(L * V);
     m->d_dlogits = gpu_alloc(L * V);
-    CUDA_CHECK(cudaMalloc((void**)&m->d_loss, sizeof(float)));
-    m->d_tokens  = gpu_alloc_int(L + 1); /* +1 : on copie seq_len+1 tokens (input+target) */
+    CUDA_CHECK(cudaMalloc(&m->d_loss, sizeof(float)));
+    m->d_tokens  = gpu_alloc_int(L);
 
     return m;
 }
@@ -533,8 +350,6 @@ static GpuModel *gpu_model_create(void) {
 static void gpu_model_init(GpuModel *m) {
     unsigned int seed = 42;
     int V = m->vocab, D = m->dim, S = m->state;
-    int R = MIMO_RANK;
-    int NR = S * R;
 
     /* Embedding : Xavier [V, D] */
     xavier_init_gpu(m->d_embed, V, D, V * D, &seed);
@@ -543,46 +358,27 @@ static void gpu_model_init(GpuModel *m) {
 
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        int TS = S / 2; if (TS < 1) TS = 1;
-        xavier_init_gpu(b->W_in,       R, D, R * D, &seed);
-        xavier_init_gpu(b->W_out,      D, R, D * R, &seed);
+        xavier_init_gpu(b->W_in,       S, D, S * D, &seed);
+        xavier_init_gpu(b->W_out,      D, S, D * S, &seed);
         a_log_init_gpu(b->A_log, S, &seed);
-        xavier_init_gpu(b->W_B,        NR, D, NR*D, &seed);
-        xavier_init_gpu(b->W_C,        NR, D, NR*D, &seed);
+        xavier_init_gpu(b->B_mat,      S, 1, S,     &seed);
+        xavier_init_gpu(b->C_mat,      S, 1, S,     &seed);
         xavier_init_gpu(b->delta_proj, 1, D, D,     &seed);
-        /* Init theta small ~ 2π/S */
-        {
-            float *h_theta = (float *)malloc(TS * sizeof(float));
-            float base = 6.2831853f / (float)S;
-            for (int ti = 0; ti < TS; ti++) {
-                float r = ((float)(seed = seed * 1664525u + 1013904223u) + 1.0f) / 4294967296.0f;
-                h_theta[ti] = r * base;
-            }
-            CUDA_CHECK(cudaMemcpy(b->theta, h_theta, TS * sizeof(float),
-                                  cudaMemcpyHostToDevice));
-            free(h_theta);
-        }
-        xavier_init_gpu(b->lambda_proj, 1, D, D, &seed);
         /* Zéro des gradients */
-        gpu_zero(b->g_W_in, R*D); gpu_zero(b->g_W_out, D*R);
-        gpu_zero(b->g_A_log, S);  gpu_zero(b->g_W_B, NR*D);
-        gpu_zero(b->g_W_C, NR*D); gpu_zero(b->g_delta_proj, D);
-        gpu_zero(b->g_theta, TS);  gpu_zero(b->g_lambda_proj, D);
+        gpu_zero(b->g_W_in, S*D); gpu_zero(b->g_W_out, D*S);
+        gpu_zero(b->g_A_log, S);  gpu_zero(b->g_B_mat, S);
+        gpu_zero(b->g_C_mat, S);  gpu_zero(b->g_delta_proj, D);
     }
 }
 
 static void gpu_zero_grads(GpuModel *m) {
     int V = m->vocab, D = m->dim, S = m->state;
-    int R = MIMO_RANK;
-    int NR = S * R;
-    int TS = S / 2; if (TS < 1) TS = 1;
     gpu_zero(m->d_g_embed, V*D); gpu_zero(m->d_g_head, V*D);
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        gpu_zero(b->g_W_in,  R*D); gpu_zero(b->g_W_out,  D*R);
-        gpu_zero(b->g_A_log, S);   gpu_zero(b->g_W_B,   NR*D);
-        gpu_zero(b->g_W_C,  NR*D); gpu_zero(b->g_delta_proj, D);
-        gpu_zero(b->g_theta, TS);   gpu_zero(b->g_lambda_proj, D);
+        gpu_zero(b->g_W_in,  S*D); gpu_zero(b->g_W_out,  D*S);
+        gpu_zero(b->g_A_log, S);   gpu_zero(b->g_B_mat,  S);
+        gpu_zero(b->g_C_mat, S);   gpu_zero(b->g_delta_proj, D);
     }
 }
 
@@ -590,7 +386,7 @@ static void gpu_zero_grads(GpuModel *m) {
 
 static float gpu_forward_backward(GpuModel *m,
                                    const uint8_t *tokens_cpu, int L) {
-    int V = m->vocab, D = m->dim, S = m->state, R = MIMO_RANK;
+    int V = m->vocab, D = m->dim, S = m->state;
     cublasHandle_t h = m->cublas;
 
     /* Copier les tokens sur GPU */
@@ -600,49 +396,43 @@ static float gpu_forward_backward(GpuModel *m,
                           cudaMemcpyHostToDevice));
     free(h_tokens_int);
 
-    /* L_in = nb de tokens en entrée du modèle (= seq_len)
-     * d_tokens[0..L_in-1] = inputs, d_tokens[1..L_in] = targets */
-    int L_in = L - 1;
-
     /* ── FORWARD ─────────────────────────────────────────────── */
 
-    /* Embedding lookup : L_in positions */
-    dim3 bg(L_in, (D + 255) / 256), tg(256, 1);
-    embed_fwd_kernel<<<bg, tg>>>(m->d_embed, m->d_tokens, m->d_hidden, L_in, D);
+    /* Embedding lookup */
+    dim3 bg(L, (D + 255) / 256), tg(256, 1);
+    embed_fwd_kernel<<<bg, tg>>>(m->d_embed, m->d_tokens, m->d_hidden, L, D);
 
     /* N blocs Mamba */
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock     *b = &m->blocks[i];
         GpuWorkspace *w = &m->ws[i];
-        /* Sauvegarder l'entrée de la couche pour le backward ET le résiduel */
-        CUDA_CHECK(cudaMemcpy(w->layer_input, m->d_hidden, L_in * D * sizeof(float),
+        /* Sauvegarder l'entrée de la couche pour le backward */
+        CUDA_CHECK(cudaMemcpy(w->layer_input, m->d_hidden, L * D * sizeof(float),
                               cudaMemcpyDeviceToDevice));
-        /* x = layer_input (copie), y = d_hidden (résultat)
-         * IMPORTANT : x != y pour que le résiduel y = y_proj + x soit correct */
         gpu_block_forward(
-            h, b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
-            b->theta, b->lambda_proj,
-            w->layer_input, m->d_hidden,
+            h, b->W_in, b->W_out, b->A_log, b->B_mat, b->C_mat, b->delta_proj,
+            m->d_hidden, m->d_hidden,   /* x=hidden, y=hidden (in-place) */
             w->u_raw, w->u, w->dt_raw, w->dt,
             w->B_exp, w->C_exp, w->dt_exp,
             w->h_store, w->y_scan, w->y_proj,
-            w->lambda_raw, w->lambda,
-            L_in, S, D, R);
+            L, S, D);
     }
 
-    /* Head : logits [L_in, V] = hidden [L_in, D] @ head^T [D, V] */
+    /* Head : logits [L, V] = hidden [L, D] @ head^T [D, V] */
+    /* head est [V, D], donc logits = hidden @ head^T */
+    /* C[L,V] = A[L,D] @ B^T  (B=[V,D])  →  gemm_bt */
     {
         float a1 = 1.0f, b0 = 0.0f;
         CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 V, L_in, D, &a1, m->d_head, D,
+                                 V, L, D, &a1, m->d_head, D,
                                  m->d_hidden, D, &b0, m->d_logits, V));
     }
 
     /* Loss + dlogits */
     CUDA_CHECK(cudaMemset(m->d_loss, 0, sizeof(float)));
-    /* targets = tokens décalés de 1 */
-    int *d_targets = m->d_tokens + 1;  /* tokens[1..L_in] comme targets[0..L_in-1] */
-    int L_loss = L_in;
+    /* targets = tokens décalés de 1 (prédire token suivant) */
+    int *d_targets = m->d_tokens + 1;  /* tokens[1..L-1] comme targets[0..L-2] */
+    int L_loss = L - 1;
     {
         int blk = (L_loss + 255) / 256;
         softmax_ce_kernel<<<blk, 256>>>(m->d_logits, d_targets,
@@ -657,42 +447,47 @@ static float gpu_forward_backward(GpuModel *m,
 
     /* ── BACKWARD ────────────────────────────────────────────── */
 
-    /* Gradient sur head : g_head [V,D] += dlogits^T @ hidden [L_in,D] */
-    gemm_gpu_at(h, V, D, L_in, 1.0f, m->d_dlogits, m->d_hidden, 1.0f, m->d_g_head);
+    /* Gradient sur head : g_head [V,D] += dlogits^T @ hidden [L,D]
+     * dlogits [L,V], hidden [L,D] : g_head[V,D] = dlogits^T [V,L] @ hidden [L,D]
+     * = gemm_at : C[V,D] = A^T (A=[L,V]) @ B [L,D] */
+    gemm_gpu_at(h, V, D, L_loss, 1.0f, m->d_dlogits, m->d_hidden, 1.0f, m->d_g_head);
 
-    /* Gradient vers hidden : d_dy [L_in,D] = dlogits [L_in,V] @ head [V,D] */
-    gemm_gpu(h, L_in, D, V, 1.0f, m->d_dlogits, m->d_head, 0.0f, m->d_dy);
+    /* Gradient vers hidden : d_dy [L,D] = dlogits [L,V] @ head [V,D] */
+    gemm_gpu(h, L_loss, D, V, 1.0f, m->d_dlogits, m->d_head, 0.0f, m->d_dy);
+    /* Les L-L_loss=1 derniers tokens n'ont pas de loss : zéro le gradient */
+    if (L > L_loss) {
+        CUDA_CHECK(cudaMemset(m->d_dy + L_loss * D, 0,
+                              (L - L_loss) * D * sizeof(float)));
+    }
 
     /* N blocs Mamba (backward, ordre inverse) */
     for (int i = m->n_layers - 1; i >= 0; i--) {
         GpuBlock     *b = &m->blocks[i];
         GpuWorkspace *w = &m->ws[i];
+        /* d_dy est le gradient entrant, d_hidden servira de gradient sortant */
         gpu_block_backward(
             h,
-            b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
-            b->theta, b->lambda_proj,
+            b->W_in, b->W_out, b->A_log, b->B_mat, b->C_mat, b->delta_proj,
             w->layer_input,
             w->u_raw, w->u, w->dt_raw, w->dt,
             w->B_exp, w->C_exp, w->dt_exp,
             w->h_store, w->y_scan,
-            w->lambda,
             m->d_dy,
             b->g_W_in, b->g_W_out, b->g_A_log,
-            b->g_W_B, b->g_W_C, b->g_delta_proj,
-            b->g_theta, b->g_lambda_proj,
-            m->d_hidden,
+            b->g_B_mat, b->g_C_mat, b->g_delta_proj,
+            m->d_hidden,  /* dx de sortie → écrase hidden */
             w->dy_scan, w->du, w->du_raw,
             w->ddt, w->ddt_raw,
             w->dB_scan, w->dC_scan, w->ddt_scan,
-            w->dA_tmp, w->dlambda, w->dlambda_raw,
-            L_in, S, D, R);
+            w->dA_tmp,
+            L, S, D);
         /* Préparer le gradient pour la couche suivante */
-        CUDA_CHECK(cudaMemcpy(m->d_dy, m->d_hidden, L_in * D * sizeof(float),
+        CUDA_CHECK(cudaMemcpy(m->d_dy, m->d_hidden, L * D * sizeof(float),
                               cudaMemcpyDeviceToDevice));
     }
 
     /* Backward embedding */
-    embed_bwd_kernel<<<bg, tg>>>(m->d_g_embed, m->d_tokens, m->d_dy, L_in, D);
+    embed_bwd_kernel<<<bg, tg>>>(m->d_g_embed, m->d_tokens, m->d_dy, L, D);
 
     return loss_h;
 }
@@ -702,8 +497,7 @@ static float gpu_forward_backward(GpuModel *m,
 static void gpu_optimizer_step(GpuModel *m, const MBOptimConfig *conf_blk,
                                 const MBOptimConfig *conf_eh) {
     m->step++;
-    int V = m->vocab, D = m->dim, S = m->state, R = MIMO_RANK;
-    int NR = S * R;
+    int V = m->vocab, D = m->dim, S = m->state;
 
     /* Embed + head : AdamW */
     adamw_update_cuda(m->d_embed, m->d_g_embed, m->d_m_embed, m->d_v_embed,
@@ -711,25 +505,22 @@ static void gpu_optimizer_step(GpuModel *m, const MBOptimConfig *conf_blk,
     adamw_update_cuda(m->d_head,  m->d_g_head,  m->d_m_head,  m->d_v_head,
                       V * D, conf_eh, m->step);
 
-    /* Blocs : MUON device-native (paramètres déjà en VRAM) */
-    int TS = S / 2; if (TS < 1) TS = 1;
+    /* Blocs : MUON (matrices W_in, W_out) + MUON vec (autres) */
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        muon_update_mat_device(b->W_in,  b->g_W_in,  b->m_W_in,  R, D, conf_blk);
-        muon_update_mat_device(b->W_out, b->g_W_out, b->m_W_out, D, R, conf_blk);
-        muon_update_vec_device(b->A_log,      b->g_A_log,      b->m_A_log,      S, conf_blk);
-        muon_update_mat_device(b->W_B,  b->g_W_B,  b->m_W_B,  NR, D, conf_blk);
-        muon_update_mat_device(b->W_C,  b->g_W_C,  b->m_W_C,  NR, D, conf_blk);
-        muon_update_vec_device(b->delta_proj, b->g_delta_proj, b->m_delta_proj, D, conf_blk);
-        muon_update_vec_device(b->theta,      b->g_theta,      b->m_theta,      TS, conf_blk);
-        muon_update_vec_device(b->lambda_proj, b->g_lambda_proj, b->m_lambda_proj, D, conf_blk);
+        muon_update_mat_cuda(b->W_in,  b->g_W_in,  b->m_W_in,  S, D, conf_blk);
+        muon_update_mat_cuda(b->W_out, b->g_W_out, b->m_W_out, D, S, conf_blk);
+        muon_update_vec_cuda(b->A_log,       b->g_A_log,       b->m_A_log,       S, conf_blk);
+        muon_update_vec_cuda(b->B_mat,       b->g_B_mat,       b->m_B_mat,       S, conf_blk);
+        muon_update_vec_cuda(b->C_mat,       b->g_C_mat,       b->m_C_mat,       S, conf_blk);
+        muon_update_vec_cuda(b->delta_proj,  b->g_delta_proj,  b->m_delta_proj,  D, conf_blk);
     }
 }
 
 /* ── Checkpoint save/load ─────────────────────────────────────── */
 
 #define CKPT_MAGIC 0x4B4D4755  /* "KMGU" */
-#define CKPT_VER   5           /* v5: lambda_proj + Adam variances embed/head */
+#define CKPT_VER   2
 
 static void save_param(FILE *f, float *d_p, size_t n) {
     float *h = (float *)malloc(n * sizeof(float));
@@ -748,8 +539,7 @@ static int load_param(FILE *f, float *d_p, size_t n) {
 static void gpu_model_save(GpuModel *m, const char *path, int epoch) {
     FILE *f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "[erreur] impossible d'écrire %s\n", path); return; }
-    int V = m->vocab, D = m->dim, S = m->state, R = MIMO_RANK;
-    int NR = S * R;
+    int V = m->vocab, D = m->dim, S = m->state;
     uint32_t magic = CKPT_MAGIC, ver = CKPT_VER;
     fwrite(&magic, 4, 1, f);
     fwrite(&ver,   4, 1, f);
@@ -758,22 +548,16 @@ static void gpu_model_save(GpuModel *m, const char *path, int epoch) {
     fwrite(cfg, 4, 5, f);
     save_param(f, m->d_embed, V * D);
     save_param(f, m->d_head,  V * D);
-    int TS = S / 2; if (TS < 1) TS = 1;
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        save_param(f, b->W_in,  R * D); save_param(f, b->W_out,  D * R);
-        save_param(f, b->A_log, S);     save_param(f, b->W_B,   NR * D);
-        save_param(f, b->W_C,  NR * D); save_param(f, b->delta_proj, D);
-        save_param(f, b->theta, TS);
-        save_param(f, b->lambda_proj, D);
-        save_param(f, b->m_W_in, R*D);  save_param(f, b->m_W_out, D*R);
-        save_param(f, b->m_A_log, S);   save_param(f, b->m_W_B, NR*D);
-        save_param(f, b->m_W_C, NR*D);  save_param(f, b->m_delta_proj, D);
-        save_param(f, b->m_theta, TS);
-        save_param(f, b->m_lambda_proj, D);
+        save_param(f, b->W_in,  S * D); save_param(f, b->W_out,  D * S);
+        save_param(f, b->A_log, S);     save_param(f, b->B_mat,  S);
+        save_param(f, b->C_mat, S);     save_param(f, b->delta_proj, D);
+        save_param(f, b->m_W_in, S*D);  save_param(f, b->m_W_out, D*S);
+        save_param(f, b->m_A_log, S);   save_param(f, b->m_B_mat, S);
+        save_param(f, b->m_C_mat, S);   save_param(f, b->m_delta_proj, D);
     }
     save_param(f, m->d_m_embed, V*D); save_param(f, m->d_m_head, V*D);
-    save_param(f, m->d_v_embed, V*D); save_param(f, m->d_v_head, V*D);
     fwrite(&m->step, sizeof(size_t), 1, f);
     fclose(f);
 }
@@ -781,42 +565,30 @@ static void gpu_model_save(GpuModel *m, const char *path, int epoch) {
 static int gpu_model_load(GpuModel *m, const char *path, int *epoch_out) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    int V = m->vocab, D = m->dim, S = m->state, R = MIMO_RANK;
-    int NR = S * R;
+    int V = m->vocab, D = m->dim, S = m->state;
     uint32_t magic, ver; int epoch;
     if (fread(&magic, 4, 1, f) != 1 || magic != CKPT_MAGIC) { fclose(f); return 0; }
-    fread(&ver, 4, 1, f);
-    if (ver != CKPT_VER) {
-        fprintf(stderr, "[erreur checkpoint] version %u != attendue %u\n", ver, CKPT_VER);
-        fclose(f); return 0;
-    }
-    fread(&epoch, 4, 1, f);
+    fread(&ver, 4, 1, f); fread(&epoch, 4, 1, f);
     int cfg[5]; fread(cfg, 4, 5, f);
-    if (cfg[0]!=V || cfg[1]!=D || cfg[2]!=S || cfg[3]!=m->n_layers || cfg[4]!=m->seq_len) {
+    if (cfg[0]!=V || cfg[1]!=D || cfg[2]!=S || cfg[3]!=m->n_layers) {
         fprintf(stderr, "[erreur checkpoint] architecture incompatible\n");
         fclose(f); return 0;
     }
     if (!load_param(f, m->d_embed, V*D) || !load_param(f, m->d_head, V*D)) {
         fclose(f); return 0;
     }
-    int TS = S / 2; if (TS < 1) TS = 1;
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        if (!load_param(f,b->W_in,R*D)     ||!load_param(f,b->W_out,D*R)||
-            !load_param(f,b->A_log,S)      ||!load_param(f,b->W_B,NR*D) ||
-            !load_param(f,b->W_C,NR*D)     ||!load_param(f,b->delta_proj,D)||
-            !load_param(f,b->theta,TS)     ||!load_param(f,b->lambda_proj,D)||
-            !load_param(f,b->m_W_in,R*D)   ||!load_param(f,b->m_W_out,D*R)||
-            !load_param(f,b->m_A_log,S)    ||!load_param(f,b->m_W_B,NR*D)||
-            !load_param(f,b->m_W_C,NR*D)   ||!load_param(f,b->m_delta_proj,D)||
-            !load_param(f,b->m_theta,TS)   ||!load_param(f,b->m_lambda_proj,D)) {
+        if (!load_param(f,b->W_in,S*D)||!load_param(f,b->W_out,D*S)||
+            !load_param(f,b->A_log,S) ||!load_param(f,b->B_mat,S)  ||
+            !load_param(f,b->C_mat,S) ||!load_param(f,b->delta_proj,D)||
+            !load_param(f,b->m_W_in,S*D)||!load_param(f,b->m_W_out,D*S)||
+            !load_param(f,b->m_A_log,S)||!load_param(f,b->m_B_mat,S)||
+            !load_param(f,b->m_C_mat,S)||!load_param(f,b->m_delta_proj,D)) {
             fclose(f); return 0;
         }
     }
-    if (!load_param(f, m->d_m_embed, V*D) || !load_param(f, m->d_m_head, V*D) ||
-        !load_param(f, m->d_v_embed, V*D) || !load_param(f, m->d_v_head, V*D)) {
-        fclose(f); return 0;
-    }
+    load_param(f, m->d_m_embed, V*D); load_param(f, m->d_m_head, V*D);
     fread(&m->step, sizeof(size_t), 1, f);
     fclose(f);
     if (epoch_out) *epoch_out = epoch;
@@ -845,7 +617,7 @@ static int sample_token(float *logits_h, int V, float temp) {
 static int gpu_generate_token(GpuModel *m, const uint8_t *ctx, int ctx_len,
                                float temperature) {
     int L = ctx_len < m->seq_len ? ctx_len : m->seq_len;
-    int D = m->dim, V = m->vocab, S = m->state, R = MIMO_RANK;
+    int D = m->dim, V = m->vocab, S = m->state;
     cublasHandle_t h = m->cublas;
 
     int *h_tok = (int *)malloc(L * sizeof(int));
@@ -863,14 +635,12 @@ static int gpu_generate_token(GpuModel *m, const uint8_t *ctx, int ctx_len,
         CUDA_CHECK(cudaMemcpy(w->layer_input, m->d_hidden, L*D*sizeof(float),
                               cudaMemcpyDeviceToDevice));
         gpu_block_forward(
-            h, b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
-            b->theta, b->lambda_proj,
-            w->layer_input, m->d_hidden,
+            h, b->W_in, b->W_out, b->A_log, b->B_mat, b->C_mat, b->delta_proj,
+            m->d_hidden, m->d_hidden,
             w->u_raw, w->u, w->dt_raw, w->dt,
             w->B_exp, w->C_exp, w->dt_exp,
             w->h_store, w->y_scan, w->y_proj,
-            w->lambda_raw, w->lambda,
-            L, S, D, R);
+            L, S, D);
     }
 
     /* Logit du dernier token : hidden[(L-1)*D ..] @ head^T */
@@ -888,92 +658,6 @@ static int gpu_generate_token(GpuModel *m, const uint8_t *ctx, int ctx_len,
     int tok = sample_token(logits_h, V, temperature);
     free(logits_h);
     return tok;
-}
-
-static float gpu_forward_loss(GpuModel *m, const uint8_t *tokens_cpu, int L) {
-    int V = m->vocab, D = m->dim, S = m->state, R = MIMO_RANK;
-    cublasHandle_t h = m->cublas;
-    int *h_tokens_int = (int *)malloc((size_t)L * sizeof(int));
-    int L_in = L - 1;
-
-    if (!h_tokens_int || L_in <= 0) {
-        free(h_tokens_int);
-        return NAN;
-    }
-
-    for (int i = 0; i < L; i++) h_tokens_int[i] = (int)tokens_cpu[i];
-    CUDA_CHECK(cudaMemcpy(m->d_tokens, h_tokens_int, (size_t)L * sizeof(int),
-                          cudaMemcpyHostToDevice));
-    free(h_tokens_int);
-
-    {
-        dim3 bg(L_in, (D + 255) / 256), tg(256, 1);
-        embed_fwd_kernel<<<bg, tg>>>(m->d_embed, m->d_tokens, m->d_hidden, L_in, D);
-    }
-
-    for (int i = 0; i < m->n_layers; i++) {
-        GpuBlock     *b = &m->blocks[i];
-        GpuWorkspace *w = &m->ws[i];
-        CUDA_CHECK(cudaMemcpy(w->layer_input, m->d_hidden, (size_t)L_in * D * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
-        gpu_block_forward(
-            h, b->W_in, b->W_out, b->A_log, b->W_B, b->W_C, b->delta_proj,
-            b->theta, b->lambda_proj,
-            w->layer_input, m->d_hidden,
-            w->u_raw, w->u, w->dt_raw, w->dt,
-            w->B_exp, w->C_exp, w->dt_exp,
-            w->h_store, w->y_scan, w->y_proj,
-            w->lambda_raw, w->lambda,
-            L_in, S, D, R);
-    }
-
-    {
-        float a1 = 1.0f, b0 = 0.0f;
-        CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
-                                 V, L_in, D, &a1, m->d_head, D,
-                                 m->d_hidden, D, &b0, m->d_logits, V));
-    }
-
-    CUDA_CHECK(cudaMemset(m->d_loss, 0, sizeof(float)));
-    {
-        int *d_targets = m->d_tokens + 1;
-        int blk = (L_in + 255) / 256;
-        softmax_ce_kernel<<<blk, 256>>>(m->d_logits, d_targets,
-                                        m->d_dlogits, m->d_loss,
-                                        L_in, V);
-    }
-
-    {
-        float loss_h = 0.0f;
-        CUDA_CHECK(cudaMemcpy(&loss_h, m->d_loss, sizeof(float),
-                              cudaMemcpyDeviceToHost));
-        return loss_h / (float)L_in;
-    }
-}
-
-static float evaluate_dataset(GpuModel *m, const Dataset *ds, size_t max_windows) {
-    size_t seq_bytes;
-    size_t available;
-    size_t windows;
-    size_t stride;
-    float loss_sum = 0.0f;
-
-    if (!m || !ds || !ds->data) return NAN;
-
-    seq_bytes = (size_t)m->seq_len + 1;
-    if (ds->len < seq_bytes) return NAN;
-
-    available = ds->len - seq_bytes + 1;
-    windows = available < max_windows ? available : max_windows;
-    if (windows == 0) windows = 1;
-    stride = windows > 1 ? (available - 1) / (windows - 1) : 0;
-
-    for (size_t i = 0; i < windows; i++) {
-        size_t start = i * stride;
-        loss_sum += gpu_forward_loss(m, &ds->data[start], (int)seq_bytes);
-    }
-
-    return loss_sum / (float)windows;
 }
 
 /* ── Chargement des données ────────────────────────────────────── */
@@ -1064,51 +748,42 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
 static void chat_repl(GpuModel *m) {
     printf("\n  k-mamba GPU — session interactive\n");
     printf("  Ctrl+D ou 'quit' pour quitter\n");
-    printf("  Format dataset : [speaker001:] / [speaker002:]\n");
     printf("  ─────────────────────────────\n\n");
 
-    /* Buffer linéaire — quand plein, on décale d'une fenêtre */
-    int CTX_MAX = m->seq_len;
-    uint8_t *ctx = (uint8_t *)malloc(CTX_MAX);
+    uint8_t ctx[1024] = {0};
     int ctx_len = 0;
     char line[512];
 
-    /* Injecter dans ctx (décale si plus de place) */
-    #define CTX_PUSH(byte) do { \
-        if (ctx_len < CTX_MAX) { ctx[ctx_len++] = (uint8_t)(byte); } \
-        else { memmove(ctx, ctx + CTX_MAX/2, CTX_MAX/2); \
-               ctx_len = CTX_MAX/2; ctx[ctx_len++] = (uint8_t)(byte); } \
-    } while(0)
-
     while (1) {
-        printf("[speaker001:] "); fflush(stdout);
+        printf("you> "); fflush(stdout);
         if (!fgets(line, sizeof(line), stdin)) break;
         size_t llen = strlen(line);
         if (llen > 0 && line[llen-1] == '\n') line[--llen] = '\0';
         if (strcmp(line, "quit") == 0) break;
         if (llen == 0) continue;
 
-        /* Format du dataset : "[speaker001:] <message>\n[speaker002:] " */
-        const char *pfx = "[speaker001:] ";
-        const char *sfx = "\n[speaker002:] ";
-        for (const char *p = pfx; *p; p++) CTX_PUSH(*p);
-        for (size_t i = 0; i < llen; i++) CTX_PUSH(line[i]);
-        for (const char *p = sfx; *p; p++) CTX_PUSH(*p);
+        /* Injecter dans le contexte */
+        const char *pfx = "Humain: ";
+        const char *sfx = "\nBot: ";
+        for (const char *p = pfx; *p; p++) {
+            ctx[ctx_len++ % 1024] = (uint8_t)*p;
+        }
+        for (size_t i = 0; i < llen; i++)
+            ctx[ctx_len++ % 1024] = (uint8_t)line[i];
+        for (const char *p = sfx; *p; p++)
+            ctx[ctx_len++ % 1024] = (uint8_t)*p;
 
-        printf("[speaker002:] ");
+        printf("CP> ");
         for (int i = 0; i < CHAT_MAX_RESP; i++) {
-            int tok = gpu_generate_token(m, ctx, ctx_len, TEMPERATURE);
+            int tok = gpu_generate_token(m, ctx + (ctx_len > 1024 ? ctx_len % 1024 : 0),
+                                         ctx_len > 1024 ? 1024 : ctx_len,
+                                         TEMPERATURE);
             if (tok == '\n' && i > 10) break;
             putchar(tok); fflush(stdout);
-            CTX_PUSH(tok);
+            ctx[ctx_len++ % 1024] = (uint8_t)tok;
         }
         printf("\n\n");
-
-        /* Ajouter le séparateur de tour */
-        CTX_PUSH('\n');
     }
-    #undef CTX_PUSH
-    free(ctx);
 }
 
 /* ── main ──────────────────────────────────────────────────────── */

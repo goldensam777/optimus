@@ -1,0 +1,1 @@
+run_id,epoch,steps_in_epoch,total_tokens,train_loss,train_ppl,train_eval_loss,train_eval_ppl,val_loss,val_ppl,grad_norm_last,grad_over_clip_last,would_clip_last,epoch_ms,step_ms_avg,tokens_per_sec,param_count,param_norm,update_norm,max_rss_kb,train_bytes,val_bytes
