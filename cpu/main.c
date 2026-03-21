@@ -26,25 +26,25 @@
 #endif
 
 /* ============================================================
- * CONFIG — instance CPU Paper (2 jours)
+ * CONFIG — instance CPU Paper (661K params)
  *
- * Cible : ~250K paramètres, convergence rapide pour papier.
+ * Cible : ~661K paramètres pour résultats paper.
  * Param count réel avec l'architecture k-mamba actuelle :
  *   embed+head = 2 * vocab * dim
  *   bloc       = W_in + W_out + A_log + W_B + W_C + b_B + b_C
  *              + delta_proj + lambda_proj + theta
- *   total      ≈ 247K paramètres
+ *   total      ≈ 661K paramètres
  * ============================================================ */
 #define VOCAB_SIZE    256
-#define DIM           128
-#define STATE_SIZE    256
+#define DIM           256
+#define STATE_SIZE    512
 #define N_LAYERS      2
 #define SEQ_LEN       128
 #define BATCH_SIZE    64
-#define N_EPOCHS      60
-#define SAVE_EVERY    5     /* sauvegarde checkpoint tous les N epochs */
-#define LR            8e-4f
-#define LR_EMBED_HEAD 8e-4f
+#define N_EPOCHS      100
+#define SAVE_EVERY    1     /* sauvegarde checkpoint tous les N epochs */
+#define LR            5e-4f
+#define LR_EMBED_HEAD 1e-4f
 #define WEIGHT_DECAY  1e-5f
 #define CLIP_NORM     1.0f
 #define MOMENTUM      0.9f
