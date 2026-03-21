@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 project(kmamba_cpu LANGUAGES C ASM_NASM)
 
 find_package(OpenMP REQUIRED)
+find_package(OpenBLAS REQUIRED)
 
 set(CMAKE_C_STANDARD 11)
 
@@ -10,7 +11,7 @@ set(CMAKE_ASM_NASM_COMPILE_OBJECT "<CMAKE_ASM_NASM_COMPILER> <INCLUDES> <FLAGS> 
 set(CMAKE_ASM_NASM_FLAGS "-f elf64 -O3")
 
 # Build k-mamba as subdirectory — CPU only
-set(KMAMBA_BUILD_TESTS   ON  CACHE BOOL "" FORCE)
+set(KMAMBA_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_BENCH   OFF CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_CUDA    OFF CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_CPU     ON  CACHE BOOL "" FORCE)
@@ -24,9 +25,13 @@ add_executable(kmamba_cpu main.c)
 add_executable(test_grad test_grad.c)
 add_executable(test_scan test_scan.c)
 
-target_link_libraries(kmamba_cpu PRIVATE k-mamba::k-mamba m OpenMP::OpenMP_C)
-target_link_libraries(test_grad  PRIVATE k-mamba::k-mamba m)
-target_link_libraries(test_scan  PRIVATE k-mamba::k-mamba m)
+target_link_libraries(kmamba_cpu PRIVATE k-mamba::k-mamba m OpenMP::OpenMP_C ${OpenBLAS_LIBRARIES})
+target_link_libraries(test_grad  PRIVATE k-mamba::k-mamba m ${OpenBLAS_LIBRARIES})
+target_link_libraries(test_scan  PRIVATE k-mamba::k-mamba m ${OpenBLAS_LIBRARIES})
+
+target_include_directories(kmamba_cpu PRIVATE ${OpenBLAS_INCLUDE_DIRS})
+target_include_directories(test_grad PRIVATE ${OpenBLAS_INCLUDE_DIRS})
+target_include_directories(test_scan PRIVATE ${OpenBLAS_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/../k-mamba/src)
 
 target_compile_options(kmamba_cpu PRIVATE
     -O3 -mavx2 -fopenmp

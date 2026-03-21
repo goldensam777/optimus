@@ -7,6 +7,7 @@
 
 #include "kmamba.h"
 #include "mamba_scan.h"
+#include "openblas_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,7 +179,7 @@ int main(void) {
         /* Aussi vérifier u_seq directement */
         printf("\n  Vérif u_seq (SiLU(W_in @ x)) sur t=0:\n");
         float z[8], u[8];
-        gemv_avx2(block->W_in.data, input, z, (long)bc.state_size, (long)bc.dim);
+        gemv_rowmajor(block->W_in.data, input, z, (int)bc.state_size, (int)bc.dim);
         silu_f32(z, u, (long)bc.state_size);
         printf("  z[0..7] : ");
         for (int d = 0; d < 8; d++) printf("%.5f ", z[d]);
@@ -202,7 +203,7 @@ int main(void) {
         float u_all[4*8];
         float ztmp[8];
         for (int t = 0; t < 4; t++) {
-            gemv_avx2(block->W_in.data, &input[t*8], ztmp, 8, 8);
+            gemv_rowmajor(block->W_in.data, &input[t*8], ztmp, 8, 8);
             silu_f32(ztmp, &u_all[t*8], 8);
         }
 

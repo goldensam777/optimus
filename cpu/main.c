@@ -36,14 +36,14 @@
  *   total      ≈ 497K paramètres
  * ============================================================ */
 #define VOCAB_SIZE    256
-#define DIM           240
-#define STATE_SIZE    256
-#define N_LAYERS      3
+#define DIM           256
+#define STATE_SIZE    512
+#define N_LAYERS      2
 #define SEQ_LEN       128
 #define BATCH_SIZE    64
-#define N_EPOCHS      50
+#define N_EPOCHS      100
 #define SAVE_EVERY    1     /* sauvegarde checkpoint tous les N epochs */
-#define LR_BLOCKS     5e-5f
+#define LR            5e-4f
 #define LR_EMBED_HEAD 1e-4f
 #define WEIGHT_DECAY  1e-5f
 #define CLIP_NORM     1.0f
@@ -627,7 +627,7 @@ int main(int argc, char *argv[]) {
     KMamba *m = NULL;
 
     /* Reprend depuis checkpoint si disponible */
-    MBOptimConfig opt = {LR_BLOCKS, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
+    MBOptimConfig opt = {LR, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
     if (ckpt_path) {
         m = kmamba_load(ckpt_path, 1, &opt, LR_EMBED_HEAD, WEIGHT_DECAY);
         if (m) printf("[checkpoint repris : %s]\n\n", ckpt_path);

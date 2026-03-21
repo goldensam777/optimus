@@ -1,0 +1,188 @@
+<svg viewBox="0 0 800 1000" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="inputGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4a90d9;stop-opacity:0.9" />
+      <stop offset="100%" style="stop-color:#2c5aa0;stop-opacity:0.9" />
+    </linearGradient>
+    <linearGradient id="mambaGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#e74c3c;stop-opacity:0.9" />
+      <stop offset="100%" style="stop-color:#c0392b;stop-opacity:0.9" />
+    </linearGradient>
+    <linearGradient id="ssmGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#27ae60;stop-opacity:0.9" />
+      <stop offset="100%" style="stop-color:#1e8449;stop-opacity:0.9" />
+    </linearGradient>
+    <linearGradient id="optimGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#9b59b6;stop-opacity:0.9" />
+      <stop offset="100%" style="stop-color:#8e44ad;stop-opacity:0.9" />
+    </linearGradient>
+    <linearGradient id="outputGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f39c12;stop-opacity:0.9" />
+      <stop offset="100%" style="stop-color:#d68910;stop-opacity:0.9" />
+    </linearGradient>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#34495e" />
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="1000" fill="#fafbfc"/>
+
+  <!-- Title -->
+  <text x="400" y="35" text-anchor="middle" font-family="Georgia, serif" font-size="28" font-weight="bold" fill="#2c3e50">
+    K-MAMBA: Selective State Space Architecture
+  </text>
+  <text x="400" y="58" text-anchor="middle" font-family="Georgia, serif" font-size="14" font-style="italic" fill="#7f8c8d">
+    "Linear Complexity Sequence Modeling" — YEVI Mawuli Peniel Samuel (IFRI-UAC, Benin)
+  </text>
+
+  <!-- Input Section -->
+  <g transform="translate(300, 90)">
+    <rect width="200" height="50" rx="8" fill="url(#inputGrad)"/>
+    <text x="100" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">Input Embedding</text>
+    <text x="100" y="38" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="rgba(255,255,255,0.9)">tokens → x ∈ R^(L×D)</text>
+  </g>
+
+  <!-- Arrow to first MambaBlock -->
+  <line x1="400" y1="140" x2="400" y2="170" stroke="#34495e" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- MambaBlock Stack -->
+  <g transform="translate(250, 180)">
+    <!-- Stack representation with 3 overlapping blocks -->
+    <rect x="20" y="0" width="260" height="100" rx="12" fill="url(#mambaGrad)" opacity="0.3"/>
+    <rect x="10" y="5" width="260" height="100" rx="12" fill="url(#mambaGrad)" opacity="0.6"/>
+    <rect x="0" y="10" width="260" height="100" rx="12" fill="url(#mambaGrad)"/>
+    <text x="130" y="40" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="white">MambaBlock × N</text>
+    <text x="130" y="62" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="rgba(255,255,255,0.9)">Volonté: SSM + Projection + Scan</text>
+    <text x="130" y="80" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="rgba(255,255,255,0.8)">Complexité O(L) vs O(L²) des Transformers</text>
+  </g>
+
+  <!-- Arrow -->
+  <line x1="400" y1="290" x2="400" y2="320" stroke="#34495e" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- MambaBlock Internals (Expanded View) -->
+  <g transform="translate(200, 330)">
+    <rect width="400" height="220" rx="15" fill="white" stroke="#bdc3c7" stroke-width="2"/>
+    <text x="200" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="bold" fill="#2c3e50">Détail du MambaBlock (Forward)</text>
+
+    <!-- Input Projection -->
+    <g transform="translate(20, 45)">
+      <rect width="80" height="40" rx="6" fill="#3498db"/>
+      <text x="40" y="15" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="white">W_in</text>
+      <text x="40" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">x → u</text>
+    </g>
+
+    <!-- SiLU -->
+    <g transform="translate(110, 45)">
+      <rect width="50" height="40" rx="6" fill="#e67e22"/>
+      <text x="25" y="23" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="white">SiLU</text>
+    </g>
+
+    <!-- Arrow to SSM -->
+    <line x1="170" y1="65" x2="200" y2="65" stroke="#7f8c8d" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+    <!-- SSM Core -->
+    <g transform="translate(210, 45)">
+      <rect width="170" height="160" rx="10" fill="url(#ssmGrad)"/>
+      <text x="85" y="18" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">Selective SSM Core</text>
+
+      <!-- Inner components -->
+      <g transform="translate(10, 30)">
+        <rect width="70" height="30" rx="4" fill="rgba(255,255,255,0.2)"/>
+        <text x="35" y="12" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">B_t = W_B·x</text>
+        <text x="35" y="24" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.8)">BCNorm</text>
+      </g>
+
+      <g transform="translate(90, 30)">
+        <rect width="70" height="30" rx="4" fill="rgba(255,255,255,0.2)"/>
+        <text x="35" y="12" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">C_t = W_C·x</text>
+        <text x="35" y="24" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.8)">BCNorm</text>
+      </g>
+
+      <g transform="translate(10, 70)">
+        <rect width="150" height="30" rx="4" fill="rgba(255,255,255,0.2)"/>
+        <text x="75" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white">Δ_t = softplus(δ_proj·x)</text>
+      </g>
+
+      <g transform="translate(10, 110)">
+        <rect width="150" height="40" rx="4" fill="rgba(255,255,255,0.15)"/>
+        <text x="75" y="15" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="white">Scan: h_t = Ā·h_(t-1) + B̄·u</text>
+        <text x="75" y="32" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.9)">Wavefront ASM (1D/2D) ou Blelloch CUDA</text>
+      </g>
+    </g>
+
+    <!-- Output projection -->
+    <line x1="385" y1="125" x2="390" y2="125" stroke="#7f8c8d" stroke-width="2" marker-end="url(#arrowhead)"/>
+    <g transform="translate(395, 105)">
+      <rect width="80" height="40" rx="6" fill="#3498db"/>
+      <text x="40" y="15" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="white">W_out</text>
+      <text x="40" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">y → output</text>
+    </g>
+
+    <!-- Skip connection label -->
+    <text x="50" y="205" font-family="Arial, sans-serif" font-size="10" fill="#7f8c8d">+ Résidu (identité)</text>
+  </g>
+
+  <!-- Arrow to output -->
+  <line x1="400" y1="550" x2="400" y2="580" stroke="#34495e" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Output Section -->
+  <g transform="translate(300, 590)">
+    <rect width="200" height="50" rx="8" fill="url(#outputGrad)"/>
+    <text x="100" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">LM Head</text>
+    <text x="100" y="38" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="rgba(255,255,255,0.9)">GEMM: hidden → logits</text>
+  </g>
+
+  <!-- Training Loop Box -->
+  <g transform="translate(150, 670)">
+    <rect width="500" height="120" rx="15" fill="white" stroke="#9b59b6" stroke-width="2" stroke-dasharray="5,5"/>
+    <text x="250" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="bold" fill="#9b59b6">Boucle d'Entraînement (Puissance)</text>
+
+    <!-- Optimizer icons -->
+    <g transform="translate(20, 45)">
+      <rect width="100" height="60" rx="8" fill="url(#optimGrad)"/>
+      <text x="50" y="22" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="white">MUON</text>
+      <text x="50" y="40" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">Blocks SSM</text>
+      <text x="50" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.8)">Newton-Schulz</text>
+    </g>
+
+    <g transform="translate(140, 45)">
+      <rect width="100" height="60" rx="8" fill="url(#optimGrad)"/>
+      <text x="50" y="22" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="white">AdamW</text>
+      <text x="50" y="40" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">Embedding</text>
+      <text x="50" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="rgba(255,255,255,0.8)">+ LM Head</text>
+    </g>
+
+    <g transform="translate(260, 45)">
+      <rect width="220" height="60" rx="8" fill="#ecf0f1" stroke="#bdc3c7" stroke-width="1"/>
+      <text x="110" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="#2c3e50">Cross-Entropy Loss</text>
+      <text x="110" y="38" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#7f8c8d">Forward → Backward (scan) → Optimizer Step</text>
+      <text x="110" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#7f8c8d">Parallélisme OpenMP / CUDA</text>
+    </g>
+  </g>
+
+  <!-- Bottom annotations -->
+  <text x="400" y="825" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#2c3e50">
+    Innovation: Scan Sélectif + Ordonnancement Wavefront ND
+  </text>
+
+  <text x="400" y="850" text-anchor="middle" font-family="Georgia, serif" font-size="11" font-style="italic" fill="#7f8c8d">
+    "Ego Sum Optimus Optimus" — Voir des structures, pas des unités
+  </text>
+
+  <!-- Key features list -->
+  <g transform="translate(50, 870)">
+    <rect width="700" height="110" rx="10" fill="white" stroke="#ecf0f1" stroke-width="2"/>
+
+    <text x="20" y="25" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#2c3e50">Points Clés:</text>
+
+    <text x="20" y="50" font-family="Arial, sans-serif" font-size="10" fill="#34495e">✓ Complexité O(L) en séquence (vs O(L²) Transformers)</text>
+    <text x="20" y="70" font-family="Arial, sans-serif" font-size="10" fill="#34495e">✓ Scan Mamba-ND natif: générateur wavefront topologique borné</text>
+    <text x="20" y="90" font-family="Arial, sans-serif" font-size="10" fill="#34495e">✓ Implémentation pure C/ASM AVX2/CUDA — zéro Python, zéro PyTorch</text>
+
+    <text x="380" y="50" font-family="Arial, sans-serif" font-size="10" fill="#34495e">✓ Architecture dualiste: Volontés (k-mamba) / Puissance (optimatrix)</text>
+    <text x="380" y="70" font-family="Arial, sans-serif" font-size="10" fill="#34495e">✓ BCNorm, Complex SSM θ, Exp-Trapezoidal discretization</text>
+    <text x="380" y="90" font-family="Arial, sans-serif" font-size="10" fill="#34495e">✓ Optimiseur MUONCLIP: Newton-Schulz orthogonalization</text>
+  </g>
+</svg>

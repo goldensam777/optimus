@@ -4,6 +4,8 @@ project(kmamba_cuda LANGUAGES C ASM_NASM CUDA)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CUDA_STANDARD 11)
 
+find_package(OpenBLAS REQUIRED)
+
 # NASM configuration
 set(CMAKE_ASM_NASM_COMPILE_OBJECT "<CMAKE_ASM_NASM_COMPILER> <INCLUDES> <FLAGS> -o <OBJECT> <SOURCE>")
 set(CMAKE_ASM_NASM_FLAGS "-f elf64 -O3")
@@ -15,7 +17,7 @@ set(KMAMBA_BUILD_CPU      ON  CACHE BOOL "" FORCE)
 set(KMAMBA_BUILD_CUDA     ON  CACHE BOOL "" FORCE)
 # Force OPTIMATRIX_BUILD_CUDA avant que optimatrix/CMakeLists.txt le lise
 set(OPTIMATRIX_BUILD_CUDA ON  CACHE BOOL "" FORCE)
-set(OPTIMATRIX_BUILD_CPU  ON  CACHE BOOL "" FORCE)
+set(OPTIMATRIX_BUILD_CPU  OFF CACHE BOOL "" FORCE)  # CPU disabled, use OpenBLAS
 
 # CUDA arch pour MX450 (Turing, sm_75)
 set(CMAKE_CUDA_ARCHITECTURES 75)
@@ -27,7 +29,12 @@ add_subdirectory(
 
 add_executable(kmamba_cuda main.cu)
 
-target_link_libraries(kmamba_cuda PRIVATE k-mamba::k-mamba m cublas)
+target_link_libraries(kmamba_cuda PRIVATE k-mamba::k-mamba m cublas ${OpenBLAS_LIBRARIES})
+
+target_include_directories(kmamba_cuda PRIVATE 
+    ${OpenBLAS_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../k-mamba/optimatrix/include
+)
 
 target_compile_options(kmamba_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -O3 -arch=sm_75>
