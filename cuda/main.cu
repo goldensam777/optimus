@@ -31,13 +31,13 @@
 
 /* ── Config modèle ────────────────────────────────────────────── */
 #define VOCAB_SIZE    256
-#define DIM           256
-#define STATE_SIZE    512
-#define N_LAYERS      5
+#define DIM           128
+#define STATE_SIZE    256
+#define N_LAYERS      2
 #define MIMO_RANK     1
-#define SEQ_LEN       256
-#define BATCH_SIZE    64
-#define N_EPOCHS      1000
+#define SEQ_LEN       128
+#define BATCH_SIZE    16
+#define N_EPOCHS      100
 #define SAVE_EVERY    5
 #define VAL_PERCENT   5
 #define VAL_EVAL_STEPS 32

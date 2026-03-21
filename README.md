@@ -7,6 +7,11 @@ exécutables prêtes à l'emploi — l'une CPU, l'autre CUDA — construites au-
 de `k-mamba` pour entraîner, tester et utiliser des modèles de langage byte-level
 de type Mamba SSM.
 
+## K-Mamba: 
+<p align="center">
+  <img src="k-mamba_architecture.svg" alt="K-Mamba banner" width="100%" />
+</p>
+
 ---
 
 ## Structure
