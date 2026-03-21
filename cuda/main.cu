@@ -31,8 +31,8 @@
 
 /* ── Config modèle ────────────────────────────────────────────── */
 #define VOCAB_SIZE    256
-#define DIM           128
-#define STATE_SIZE    256
+#define DIM           224
+#define STATE_SIZE    448
 #define N_LAYERS      2
 #define MIMO_RANK     1
 #define SEQ_LEN       128
@@ -315,6 +315,20 @@ static double elapsed_ms(const struct timespec *t0) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (double)(t1.tv_sec - t0->tv_sec) * 1000.0
          + (double)(t1.tv_nsec - t0->tv_nsec) / 1.0e6;
+}
+
+/* ── Learning Rate Scheduler ──────────────────────────────────── */
+
+static float lr_schedule(float lr_max, size_t step,
+                         size_t warmup_steps, size_t total_steps) {
+    if (step == 0) return 0.0f;
+    if (step < warmup_steps)
+        return lr_max * (float)step / (float)warmup_steps;
+    float progress = (float)(step - warmup_steps)
+                   / (float)(total_steps - warmup_steps);
+    float cosine   = 0.5f * (1.0f + cosf(M_PI * progress));
+    float lr_min   = lr_max * 0.1f;
+    return lr_min + (lr_max - lr_min) * cosine;
 }
 
 static float l2_norm_f32(const float *a, size_t n) {
@@ -1005,12 +1019,19 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
     printf("[optimizer : MUON GPU (Newton-Schulz, MX450 sm_75)]\n\n");
     printf("entraînement : %d epochs × %d steps × batch=%d\n\n",
            N_EPOCHS, steps_per_epoch, BATCH_SIZE);
-    printf(" epoch |   loss   |  ms/epoch\n");
-    printf("-------+----------+-----------\n");
+    printf(" epoch |   loss   |  ms/epoch |    lr    \n");
+    printf("-------+----------+-----------+-----------\n");
     fflush(stdout);
 
-    MBOptimConfig conf_blk = {LR_BLOCKS,     MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
-    MBOptimConfig conf_eh  = {LR_EMBED_HEAD, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
+    /* LR Scheduler: warmup + cosine decay */
+    size_t total_steps = (size_t)N_EPOCHS * (size_t)steps_per_epoch;
+    size_t warmup_steps = total_steps / 20;  /* 5% warmup */
+    float lr_max_blk = LR_BLOCKS;
+    float lr_max_eh = LR_EMBED_HEAD;
+    size_t global_step = 0;
+
+    MBOptimConfig conf_blk = {lr_max_blk, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
+    MBOptimConfig conf_eh  = {lr_max_eh,  MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
 
     int start_epoch = 0;
     if (ckpt_path && gpu_model_load(m, ckpt_path, &start_epoch)) {
@@ -1024,6 +1045,12 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
         double epoch_loss = 0.0;
 
         for (int step = 0; step < steps_per_epoch; step++) {
+            global_step++;
+            
+            /* Update learning rate */
+            conf_blk.lr = lr_schedule(lr_max_blk, global_step, warmup_steps, total_steps);
+            conf_eh.lr  = lr_schedule(lr_max_eh,  global_step, warmup_steps, total_steps);
+
             gpu_zero_grads(m);
             float batch_loss = 0.0f;
 
@@ -1038,8 +1065,8 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
             gpu_optimizer_step(m, &conf_blk, &conf_eh);
 
             if ((step + 1) % 50 == 0 || step == steps_per_epoch - 1) {
-                printf("       step %4d/%d  loss=%.4f\r",
-                       step + 1, steps_per_epoch, batch_loss);
+                printf("       step %4d/%d  loss=%.4f  lr=%.2e\r",
+                       step + 1, steps_per_epoch, batch_loss, conf_blk.lr);
                 fflush(stdout);
             }
         }
@@ -1048,7 +1075,7 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
 
-        printf(" %5d | %8.4f | %9.1f\n", epoch, epoch_loss, ms);
+        printf(" %5d | %8.4f | %9.1f | %.2e\n", epoch, epoch_loss, ms, conf_blk.lr);
         fflush(stdout);
 
         if (ckpt_path && epoch % SAVE_EVERY == 0)

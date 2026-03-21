@@ -515,6 +515,24 @@ static double elapsed_ms(struct timespec *t0) {
          + (double)(t1.tv_nsec - t0->tv_nsec) / 1e6;
 }
 
+/* ── Learning Rate Scheduler ──────────────────────────────────── */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+static float lr_schedule(float lr_max, size_t step,
+                           size_t warmup_steps, size_t total_steps) {
+    if (step == 0) return 0.0f;
+    if (step < warmup_steps)
+        return lr_max * (float)step / (float)warmup_steps;
+    float progress = (float)(step - warmup_steps)
+                   / (float)(total_steps - warmup_steps);
+    float cosine   = 0.5f * (1.0f + cosf(M_PI * progress));
+    float lr_min   = lr_max * 0.1f;
+    return lr_min + (lr_max - lr_min) * cosine;
+}
+
 /* ============================================================
  * main
  * ============================================================ */
@@ -627,15 +645,17 @@ int main(int argc, char *argv[]) {
     KMamba *m = NULL;
 
     /* Reprend depuis checkpoint si disponible */
-    MBOptimConfig opt = {LR, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
+    float lr_max = LR;
+    float lr_max_embed = LR_EMBED_HEAD;
+    MBOptimConfig opt = {lr_max, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
     if (ckpt_path) {
-        m = kmamba_load(ckpt_path, 1, &opt, LR_EMBED_HEAD, WEIGHT_DECAY);
+        m = kmamba_load(ckpt_path, 1, &opt, lr_max_embed, WEIGHT_DECAY);
         if (m) printf("[checkpoint repris : %s]\n\n", ckpt_path);
     }
     if (!m) {
         m = kmamba_create(&cfg);
         kmamba_init(m, SEED);
-        kmamba_enable_training_with_optimizer(m, OPTIMIZER_ADAMW, &opt, LR_EMBED_HEAD, WEIGHT_DECAY);
+        kmamba_enable_training_with_optimizer(m, OPTIMIZER_ADAMW, &opt, lr_max_embed, WEIGHT_DECAY);
         printf("[modèle initialisé (Xavier, seed=%d)]\n\n", SEED);
     }
 
@@ -657,7 +677,7 @@ int main(int argc, char *argv[]) {
     step_log_path = make_log_path(log_prefix, "step");
     epoch_log_path = make_log_path(log_prefix, "epoch");
     step_log = open_csv_log(step_log_path,
-        "run_id,epoch,step_in_epoch,global_step,train_loss,train_ppl,grad_norm,grad_over_clip,would_clip,step_ms,tokens_per_sec,max_rss_kb,bad_loss");
+        "run_id,epoch,step_in_epoch,global_step,train_loss,train_ppl,grad_norm,grad_over_clip,would_clip,step_ms,tokens_per_sec,max_rss_kb,bad_loss,lr");
     epoch_log = open_csv_log(epoch_log_path,
         "run_id,epoch,steps_in_epoch,total_tokens,train_loss,train_ppl,train_eval_loss,train_eval_ppl,val_loss,val_ppl,grad_norm_last,grad_over_clip_last,would_clip_last,epoch_ms,step_ms_avg,tokens_per_sec,param_count,param_norm,update_norm,max_rss_kb,train_bytes,val_bytes");
     if (step_log) setvbuf(step_log, NULL, _IOLBF, 0);
@@ -691,10 +711,16 @@ int main(int argc, char *argv[]) {
     size_t global_step = 0;
     if (steps_per_epoch < 1) steps_per_epoch = 1;
 
+    /* LR Scheduler: warmup + cosine decay (2-3% warmup for Adam) */
+    size_t total_steps = (size_t)N_EPOCHS * steps_per_epoch;
+    size_t warmup_steps = total_steps / 40;  /* 2.5% warmup */
+    float current_lr = lr_max;
+    float current_lr_embed = lr_max_embed;
+
     printf("entraînement : %d epochs × %zu steps × batch=%d\n\n",
            N_EPOCHS, steps_per_epoch, BATCH_SIZE);
-    printf(" epoch | train_bt | train_ev |   val    |  tok/s   |  ms/epoch\n");
-    printf("-------+----------+----------+----------+----------+-----------\n");
+    printf(" epoch | train_bt | train_ev |   val    |  tok/s   |  ms/epoch |    lr\n");
+    printf("-------+----------+----------+----------+----------+-----------+-----------\n");
     fflush(stdout);
 
     for (int epoch = 1; epoch <= N_EPOCHS; epoch++) {
@@ -709,6 +735,15 @@ int main(int argc, char *argv[]) {
             double step_ms;
             double step_tokens_s;
             float batch_loss;
+
+            global_step++;
+
+            /* Update learning rate */
+            current_lr = lr_schedule(lr_max, global_step, warmup_steps, total_steps);
+            current_lr_embed = lr_schedule(lr_max_embed, global_step, warmup_steps, total_steps);
+            opt.lr = current_lr;
+            /* Note: embed LR is handled via kmamba_update_training_state or direct access */
+
             clock_gettime(CLOCK_MONOTONIC, &step_t0);
             sample_batch(&train_ds, batch, BATCH_SIZE);
             batch_loss = kmamba_train_batch(m, batch, BATCH_SIZE);
@@ -717,23 +752,22 @@ int main(int argc, char *argv[]) {
                 ? ((double)BATCH_SIZE * (double)SEQ_LEN * 1000.0) / step_ms
                 : 0.0;
 
-            global_step++;
             loss_sum += batch_loss;
             step_ms_sum += step_ms;
             if (!isfinite(batch_loss)) bad_loss = 1;
 
             if (step_log) {
-                fprintf(step_log, "%llu,%d,%zu,%zu,%.6f,%.6f,%.6f,%.6f,%d,%.3f,%.3f,%zu,%d\n",
+                fprintf(step_log, "%llu,%d,%zu,%zu,%.6f,%.6f,%.6f,%.6f,%d,%.3f,%.3f,%zu,%d,%.6f\n",
                         run_id, epoch, s + 1, global_step,
                         batch_loss, safe_perplexity(batch_loss),
                         m->last_grad_norm, m->last_grad_over_clip, m->last_grad_would_clip,
-                        step_ms, step_tokens_s, current_rss_kb(), bad_loss);
+                        step_ms, step_tokens_s, current_rss_kb(), bad_loss, current_lr);
             }
 
             if ((s + 1) % PRINT_EVERY == 0 || s + 1 == steps_per_epoch) {
-                printf("       step %4zu/%zu  loss=%8.4f  grad=%12.4f      \r",
+                printf("       step %4zu/%zu  loss=%8.4f  grad=%12.4f  lr=%.2e\r",
                        s + 1, steps_per_epoch,
-                       loss_sum / (float)(s + 1), m->last_grad_norm);
+                       loss_sum / (float)(s + 1), m->last_grad_norm, current_lr);
                 fflush(stdout);
             }
         }
@@ -758,8 +792,8 @@ int main(int argc, char *argv[]) {
         update_norm = l2_diff_norm_f32(curr_params, prev_params, total_params);
         memcpy(prev_params, curr_params, total_params * sizeof(float));
 
-        printf("  %4d | %8.4f | %8.4f | %8.4f | %8.0f | %8.1f\n",
-               epoch, avg_loss, train_eval_loss, val_loss, tokens_s, ms);
+        printf("  %4d | %8.4f | %8.4f | %8.4f | %8.0f | %8.1f | %.2e\n",
+               epoch, avg_loss, train_eval_loss, val_loss, tokens_s, ms, current_lr);
         fflush(stdout);
 
         if (epoch_log) {
