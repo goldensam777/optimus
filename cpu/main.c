@@ -378,8 +378,8 @@ static void generate(KMamba *m, const char *prompt, size_t gen_len) {
         /* Prend les logits du dernier token */
         uint8_t next = sample_token(&logits[(L - 1) * V], V, TEMPERATURE);
         /* Affiche le byte généré (printable ou '?') */
-        if (next >= 32 && next < 127) putchar((char)next);
-        else if (next == '\n') putchar('\n');
+        if (next == '\n') putchar('\n');
+        else if (next >= 32) putchar((char)next);
         else putchar('?');
         fflush(stdout);
         /* Décale le contexte */
@@ -459,7 +459,7 @@ static void chat_repl(KMamba *m) {
             }
 
             /* Affiche le token généré */
-            putchar((next >= 32 && next < 127) ? (char)next : '?');
+            putchar((next == '\n') ? '\n' : (next >= 32) ? (char)next : '?');
             fflush(stdout);
 
             /* Glisse le contexte */
