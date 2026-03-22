@@ -128,8 +128,10 @@ typedef struct {
     float *m_delta_proj;
     float *m_lambda_proj;  /* [dim] */
     float *m_theta;        /* [state/2] */
-    /* Variance (AdamW pour embed/head) */
+    /* Variance (AdamW) */
     float *v_W_in,  *v_W_out;
+    float *v_A_log, *v_W_B, *v_W_C;
+    float *v_delta_proj, *v_theta, *v_lambda_proj;
 } GpuBlock;
 
 /* ── Workspace forward/backward par layer ───────────────────── */
@@ -520,7 +522,7 @@ static GpuModel *gpu_model_create(void) {
         w->dt_raw   = gpu_alloc(L);     w->dt      = gpu_alloc(L);
         w->B_exp    = gpu_alloc(L * NR); w->C_exp   = gpu_alloc(L * NR);
         w->dt_exp   = gpu_alloc(L * NR); w->h_store = gpu_alloc(L * S);
-        w->y_scan   = gpu_alloc(L * R);  w->y_proj  = gpu_alloc(L * D);
+        w->y_scan   = gpu_alloc(L * S);  w->y_proj  = gpu_alloc(L * D);
         /* Workspace backward */
         w->dy_scan  = gpu_alloc(L * R);  w->du      = gpu_alloc(L * R);
         w->du_raw   = gpu_alloc(L * R);  w->ddt     = gpu_alloc(L);
@@ -725,18 +727,18 @@ static void gpu_optimizer_step(GpuModel *m, const MBOptimConfig *conf_blk,
     adamw_update_cuda(m->d_head,  m->d_g_head,  m->d_m_head,  m->d_v_head,
                       V * D, conf_eh, m->step);
 
-    /* Blocs : MUON device-native (paramètres déjà en VRAM) */
+    /* Blocs : AdamW */
     int TS = S / 2; if (TS < 1) TS = 1;
     for (int i = 0; i < m->n_layers; i++) {
         GpuBlock *b = &m->blocks[i];
-        muon_update_mat_device(b->W_in,  b->g_W_in,  b->m_W_in,  R, D, conf_blk);
-        muon_update_mat_device(b->W_out, b->g_W_out, b->m_W_out, D, R, conf_blk);
-        muon_update_vec_device(b->A_log,      b->g_A_log,      b->m_A_log,      S, conf_blk);
-        muon_update_mat_device(b->W_B,  b->g_W_B,  b->m_W_B,  NR, D, conf_blk);
-        muon_update_mat_device(b->W_C,  b->g_W_C,  b->m_W_C,  NR, D, conf_blk);
-        muon_update_vec_device(b->delta_proj, b->g_delta_proj, b->m_delta_proj, D, conf_blk);
-        muon_update_vec_device(b->theta,      b->g_theta,      b->m_theta,      TS, conf_blk);
-        muon_update_vec_device(b->lambda_proj, b->g_lambda_proj, b->m_lambda_proj, D, conf_blk);
+        adamw_update_cuda(b->W_in,  b->g_W_in,  b->m_W_in,  b->v_W_in,  R*D,  conf_blk, m->step);
+        adamw_update_cuda(b->W_out, b->g_W_out, b->m_W_out, b->v_W_out, D*R,  conf_blk, m->step);
+        adamw_update_cuda(b->A_log,       b->g_A_log,       b->m_A_log,       b->v_A_log,       S,    conf_blk, m->step);
+        adamw_update_cuda(b->W_B,  b->g_W_B,  b->m_W_B,  b->v_W_B,  NR*D, conf_blk, m->step);
+        adamw_update_cuda(b->W_C,  b->g_W_C,  b->m_W_C,  b->v_W_C,  NR*D, conf_blk, m->step);
+        adamw_update_cuda(b->delta_proj, b->g_delta_proj, b->m_delta_proj, b->v_delta_proj, D,  conf_blk, m->step);
+        adamw_update_cuda(b->theta,      b->g_theta,      b->m_theta,      b->v_theta,      TS, conf_blk, m->step);
+        adamw_update_cuda(b->lambda_proj, b->g_lambda_proj, b->m_lambda_proj, b->v_lambda_proj, D, conf_blk, m->step);
     }
 }
 
@@ -1003,56 +1005,104 @@ static uint8_t *load_data(const char *path, size_t *out_len) {
 
 /* ── Entraînement ──────────────────────────────────────────────── */
 
+/* ── Helpers logging ─────────────────────────────────────────── */
+static FILE *open_csv(const char *prefix, const char *kind, const char *header) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s.%s.csv", prefix, kind);
+    FILE *f = fopen(path, "a");
+    if (!f) { fprintf(stderr, "[warning] impossible d'ouvrir %s\n", path); return NULL; }
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fprintf(f, "%s\n", header);
+    fflush(f);
+    return f;
+}
+
+static float compute_grad_norm(GpuModel *m) {
+    /* Norme L2 approx sur g_embed comme proxy rapide */
+    int n = VOCAB_SIZE * m->dim;
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) return 0.0f;
+    cudaMemcpy(h, m->d_g_embed, n * sizeof(float), cudaMemcpyDeviceToHost);
+    double s = 0.0;
+    for (int i = 0; i < n; i++) s += (double)h[i] * (double)h[i];
+    free(h);
+    return (float)sqrt(s);
+}
+
+static float compute_val_loss(GpuModel *m, const uint8_t *data,
+                               size_t data_len, int L, int n_val) {
+    double vl = 0.0;
+    for (int i = 0; i < n_val; i++) {
+        size_t off = (size_t)rand() % (data_len - L);
+        uint8_t *seq = (uint8_t *)malloc(L * sizeof(uint8_t));
+        memcpy(seq, data + off, L);
+        vl += gpu_forward_backward(m, seq, L);
+        free(seq);
+    }
+    return (float)(vl / n_val);
+}
+
 static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
     size_t data_len = 0;
     uint8_t *data = load_data(data_path, &data_len);
     if (!data) return;
 
-    int L  = m->seq_len + 1;   /* +1 pour le token cible */
+    int L  = m->seq_len + 1;
     int steps = (int)((data_len - 1) / m->seq_len);
     if (steps == 0) { fprintf(stderr, "[erreur] données trop courtes\n"); free(data); return; }
     int steps_per_epoch = steps / BATCH_SIZE;
     if (steps_per_epoch == 0) steps_per_epoch = 1;
 
+    /* CSV logging */
+    unsigned int run_id = (unsigned int)time(NULL);
+    char prefix[64]; snprintf(prefix, sizeof(prefix), "cuda_run");
+    FILE *f_step  = open_csv(prefix, "step",
+        "run_id,epoch,step,loss,grad_norm,lr,tokens_per_sec");
+    FILE *f_epoch = open_csv(prefix, "epoch",
+        "run_id,epoch,steps_in_epoch,train_loss,val_loss,grad_norm_last,epoch_ms,tokens_per_sec,param_count,lr");
+
     printf("\n[données] %s — %zu bytes\n\n", data_path, data_len);
     printf("[modèle initialisé (Xavier, seed=42)]\n");
-    printf("[optimizer : MUON GPU (Newton-Schulz, MX450 sm_75)]\n\n");
+    printf("[optimizer : AdamW GPU (sm_75)]\n\n");
     printf("entraînement : %d epochs × %d steps × batch=%d\n\n",
            N_EPOCHS, steps_per_epoch, BATCH_SIZE);
-    printf(" epoch |   loss   |  ms/epoch |    lr    \n");
-    printf("-------+----------+-----------+-----------\n");
+
+    printf(" epoch | train_bt | train_ev |   val    |  tok/s   |  ms/epoch |    lr\n");
+    printf("-------+----------+----------+----------+----------+-----------+-----------\n");
     fflush(stdout);
 
-    /* LR Scheduler: warmup + cosine decay */
     size_t total_steps = (size_t)N_EPOCHS * (size_t)steps_per_epoch;
-    size_t warmup_steps = total_steps / 20;  /* 5% warmup */
+    size_t warmup_steps = total_steps / 20;
     float lr_max_blk = LR_BLOCKS;
-    float lr_max_eh = LR_EMBED_HEAD;
+    float lr_max_eh  = LR_EMBED_HEAD;
     size_t global_step = 0;
 
     MBOptimConfig conf_blk = {lr_max_blk, MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
     MBOptimConfig conf_eh  = {lr_max_eh,  MOMENTUM, BETA2, EPS, CLIP_NORM, WEIGHT_DECAY};
 
     int start_epoch = 0;
-    if (ckpt_path && gpu_model_load(m, ckpt_path, &start_epoch)) {
+    if (ckpt_path && gpu_model_load(m, ckpt_path, &start_epoch))
         printf("[checkpoint : %s (epoch %d)]\n", ckpt_path, start_epoch);
-    }
 
     uint8_t *seq = (uint8_t *)malloc(L * sizeof(uint8_t));
+    int tokens_per_step = BATCH_SIZE * m->seq_len;
 
     for (int epoch = start_epoch + 1; epoch <= N_EPOCHS; epoch++) {
         struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         double epoch_loss = 0.0;
+        float  last_grad  = 0.0f;
+        float  last_lr    = lr_max_blk;
 
         for (int step = 0; step < steps_per_epoch; step++) {
             global_step++;
-            
-            /* Update learning rate */
+
             conf_blk.lr = lr_schedule(lr_max_blk, global_step, warmup_steps, total_steps);
             conf_eh.lr  = lr_schedule(lr_max_eh,  global_step, warmup_steps, total_steps);
+            last_lr = conf_blk.lr;
 
             gpu_zero_grads(m);
             float batch_loss = 0.0f;
+            struct timespec s0; clock_gettime(CLOCK_MONOTONIC, &s0);
 
             for (int b = 0; b < BATCH_SIZE; b++) {
                 size_t off = (size_t)rand() % (data_len - L);
@@ -1064,18 +1114,47 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
 
             gpu_optimizer_step(m, &conf_blk, &conf_eh);
 
+            struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
+            double step_ms = (s1.tv_sec - s0.tv_sec)*1e3 + (s1.tv_nsec - s0.tv_nsec)*1e-6;
+            float tps = (step_ms > 0) ? (float)(tokens_per_step / (step_ms / 1000.0)) : 0;
+
+            last_grad = compute_grad_norm(m);
+
+            if (f_step) {
+                fprintf(f_step, "%u,%d,%d,%.6f,%.6f,%.6e,%.1f\n",
+                        run_id, epoch, step+1, batch_loss, last_grad, conf_blk.lr, tps);
+                fflush(f_step);
+            }
+
             if ((step + 1) % 50 == 0 || step == steps_per_epoch - 1) {
-                printf("       step %4d/%d  loss=%.4f  lr=%.2e\r",
-                       step + 1, steps_per_epoch, batch_loss, conf_blk.lr);
+                printf("       step %4d/%d  loss=%7.4f  grad=%10.6f  lr=%.2e\r",
+                       step+1, steps_per_epoch, batch_loss, last_grad, conf_blk.lr);
                 fflush(stdout);
             }
         }
         epoch_loss /= steps_per_epoch;
 
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
+        double epoch_ms = (t1.tv_sec - t0.tv_sec)*1e3 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
+        float epoch_tps = (epoch_ms > 0)
+            ? (float)(tokens_per_step * steps_per_epoch / (epoch_ms / 1000.0)) : 0;
 
-        printf(" %5d | %8.4f | %9.1f | %.2e\n", epoch, epoch_loss, ms, conf_blk.lr);
+        /* Val loss sur 64 séquences aléatoires */
+        float val_loss = compute_val_loss(m, data, data_len, L, 64);
+
+        /* Train eval sur 64 séquences */
+        float train_eval = compute_val_loss(m, data, data_len, L, 64);
+
+        if (f_epoch) {
+            fprintf(f_epoch, "%u,%d,%d,%.6f,%.6f,%.6f,%.1f,%.1f,%d,%.6e\n",
+                    run_id, epoch, steps_per_epoch,
+                    epoch_loss, val_loss, last_grad,
+                    epoch_ms, epoch_tps, 519000, last_lr);
+            fflush(f_epoch);
+        }
+
+        printf(" %5d | %8.4f | %8.4f | %8.4f | %8.0f | %9.1f | %.2e\n",
+               epoch, (float)epoch_loss, train_eval, val_loss, epoch_tps, epoch_ms, last_lr);
         fflush(stdout);
 
         if (ckpt_path && epoch % SAVE_EVERY == 0)
@@ -1083,6 +1162,8 @@ static void train(GpuModel *m, const char *data_path, const char *ckpt_path) {
     }
 
     if (ckpt_path) gpu_model_save(m, ckpt_path, N_EPOCHS);
+    if (f_step)  fclose(f_step);
+    if (f_epoch) fclose(f_epoch);
     free(seq); free(data);
 }
 
